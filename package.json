@@ -1,0 +1,68 @@
+{
+  "name": "highlight-ai",
+  "description": "Local-first AI gaming highlight creator",
+  "author": "HighlightAI Contributors",
+  "license": "MIT",
+  "main": "desktop/main.mjs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "api": "node server/index.mjs",
+    "dev:full": "node server/dev.mjs",
+    "desktop": "npm run build && electron .",
+    "desktop:dev": "concurrently -k \"node server/index.mjs\" \"vite\" \"electron . --dev\"",
+    "package:win": "npm run build && node scripts/prepare-icon.mjs && node scripts/prepare-ffmpeg.mjs && electron-builder --win portable",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "start": "node server/index.mjs",
+    "test": "vitest run",
+    "verify": "npm run build && npm test && node --check server/index.mjs && node --check server/media.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "multer": "^2.0.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^10.0.3",
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.3",
+    "jsdom": "^25.0.1",
+    "sharp": "^0.35.1",
+    "typescript": "~5.7.2",
+    "vite": "^8.0.16",
+    "vitest": "^2.1.8",
+    "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "org.highlightai.desktop",
+    "productName": "HighlightAI",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "server/**/*",
+      "vendor/**/*",
+      "dist/**/*",
+      "package.json",
+      "README.md",
+      "LICENSE",
+      "node_modules/**/*"
+    ],
+    "asar": false,
+    "win": {
+      "target": "portable",
+      "icon": "build/icon.png"
+    }
+  }
+}

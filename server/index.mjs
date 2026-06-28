@@ -415,7 +415,13 @@ app.post("/api/projects/:id/reconcile", async (req, res, next) => {
           currentFile: fastJob.currentFile,
           activeFiles: fastJob.activeFiles
         });
-        const progress = summarizeFastIndexProgress(project, fastJob);
+        const jobCompleted = ["completed", "completed_with_warnings"].includes(String(fastJob.status || ""));
+        const progress = jobCompleted
+          ? {
+              processedFiles: Math.max(Number(fastJob.totalFiles || 0), Number(fastJob.processedFiles || 0)),
+              candidateWindows: countFastIndexCandidateWindows(project, fastJob)
+            }
+          : summarizeFastIndexProgress(project, fastJob);
         fastJob.processedFiles = progress.processedFiles;
         fastJob.candidateWindows = progress.candidateWindows;
         if (progress.processedFiles >= fastJob.totalFiles && !["completed", "completed_with_warnings"].includes(fastJob.status)) {
@@ -435,13 +441,14 @@ app.post("/api/projects/:id/reconcile", async (req, res, next) => {
           activeFiles: fastJob.activeFiles
         });
         if (nextJobState !== previousJobState) await saveFastIndexJob(fastJob);
+        const normalizedFastIndex = normalizeFastIndexProgressFields(fastJob);
         const nextFastIndex = {
           ...project.fastIndex,
           jobId: fastJob.id,
           status: fastJob.status,
           phase: fastJob.phase,
-          processedFiles: fastJob.processedFiles,
-          totalFiles: fastJob.totalFiles,
+          processedFiles: normalizedFastIndex.processedFiles,
+          totalFiles: normalizedFastIndex.totalFiles,
           candidateWindows: fastJob.candidateWindows,
           estimatedSeconds: fastJob.estimatedSeconds,
           etaSeconds: fastJob.etaSeconds,
@@ -2165,7 +2172,28 @@ function publicPreprocessJob(job) {
 
 function publicFastIndexJob(job) {
   const { files: _, cancelRequested: __, ...safe } = job;
+  const counts = normalizeFastIndexProgressFields(safe);
+  safe.totalFiles = counts.totalFiles;
+  safe.processedFiles = counts.processedFiles;
+  if (["completed", "completed_with_warnings", "failed", "cancelled"].includes(String(safe.status || ""))) {
+    if (["completed", "completed_with_warnings"].includes(String(safe.status || ""))) {
+      safe.processedFiles = safe.totalFiles;
+      safe.completedAt = safe.completedAt || safe.updatedAt || new Date().toISOString();
+    }
+    safe.etaSeconds = 0;
+    safe.currentFile = null;
+    safe.activeFiles = [];
+  }
   return safe;
+}
+
+function normalizeFastIndexProgressFields(job) {
+  const rawProcessed = Math.max(0, Number(job?.processedFiles || 0));
+  const rawTotal = Math.max(0, Number(job?.totalFiles || 0));
+  const completed = ["completed", "completed_with_warnings"].includes(String(job?.status || ""));
+  const totalFiles = completed ? Math.max(rawTotal, rawProcessed) : rawTotal || rawProcessed;
+  const processedFiles = completed ? totalFiles : Math.min(totalFiles || rawProcessed, rawProcessed);
+  return { processedFiles, totalFiles };
 }
 
 async function markFastIndexJobFailed(id, error) {
@@ -2490,7 +2518,9 @@ function summarizeFastIndexProgress(project, job) {
   const filesById = new Map(project.files.map((file) => [file.id, file]));
   const pendingFiles = job.files.filter((pending) => {
     const file = filesById.get(pending.id);
-    return file && !hasReusableFastIndex(file, job.maxWindowsPerFile || FAST_INDEX_MIN_WINDOWS);
+    return file
+      && file.metadata?.fastIndexJobId !== job.id
+      && !hasReusableFastIndex(file, job.maxWindowsPerFile || FAST_INDEX_MIN_WINDOWS);
   });
   const totalFiles = Math.max(0, Number(job.totalFiles) || job.files.length);
   const processedFiles = Math.min(totalFiles, Math.max(0, job.files.length - pendingFiles.length));
@@ -2499,6 +2529,14 @@ function summarizeFastIndexProgress(project, job) {
     return sum + (Array.isArray(file?.metadata?.candidateWindows) ? file.metadata.candidateWindows.length : 0);
   }, 0);
   return { pendingFiles, processedFiles, candidateWindows };
+}
+
+function countFastIndexCandidateWindows(project, job) {
+  const filesById = new Map(project.files.map((file) => [file.id, file]));
+  return job.files.reduce((sum, pending) => {
+    const file = filesById.get(pending.id);
+    return sum + (Array.isArray(file?.metadata?.candidateWindows) ? file.metadata.candidateWindows.length : 0);
+  }, 0);
 }
 
 async function createFastIndexJob(project, options = {}) {

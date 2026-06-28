@@ -334,6 +334,51 @@ describe("path management", () => {
     expect(container.querySelectorAll(".background-service")).toHaveLength(1);
   });
 
+  it("normalizes stale completed fast-index counts instead of showing unfinished work", async () => {
+    const staleCompletedProject = {
+      ...savedFolderProject,
+      fastIndex: {
+        jobId: "stale-completed-index",
+        status: "completed",
+        phase: "completed",
+        processedFiles: 130,
+        totalFiles: 139,
+        candidateWindows: 535,
+        etaSeconds: 0,
+        updatedAt: "2026-06-28T00:00:00.000Z"
+      }
+    } as Project;
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(staleCompletedProject);
+    vi.mocked(api.getFastIndexJob).mockResolvedValueOnce({
+      id: "stale-completed-index",
+      kind: "fast-candidate-index",
+      projectId: staleCompletedProject.id,
+      status: "completed",
+      phase: "completed",
+      totalFiles: 139,
+      totalProjectFiles: 140,
+      processedFiles: 130,
+      candidateWindows: 535,
+      currentFile: null,
+      failures: [],
+      estimatedSeconds: 393,
+      etaSeconds: 0,
+      storageBytes: 1000,
+      concurrency: 3,
+      windowDuration: 14,
+      maxWindowsPerFile: 4,
+      createdAt: "2026-06-28T00:00:00.000Z",
+      updatedAt: "2026-06-28T00:05:00.000Z"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Saved Folder/i }));
+
+    expect(await screen.findByText("139/139 files scanned")).toBeInTheDocument();
+    expect(screen.queryByText("130/139 files scanned")).not.toBeInTheDocument();
+    expect(screen.getByText("completed", { selector: ".preprocess-metrics strong" })).toBeInTheDocument();
+  });
+
   it("shows active Vision AI batch progress instead of clamped whole-folder progress", async () => {
     const livePreprocessJob: PreprocessJob = {
       id: "live-preprocess",

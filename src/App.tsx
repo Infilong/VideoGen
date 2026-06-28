@@ -121,6 +121,17 @@ function limitVisionQueue<T>(files: T[], limits: AiResourceLimits): T[] {
   return limits.maxVideosPerRun > 0 ? files.slice(0, limits.maxVideosPerRun) : files;
 }
 
+function normalizedFastIndexCounts(job?: { status?: string; processedFiles?: number; totalFiles?: number } | null) {
+  const rawProcessed = Math.max(0, Number(job?.processedFiles || 0));
+  const rawTotal = Math.max(0, Number(job?.totalFiles || 0));
+  const completed = ["completed", "completed_with_warnings"].includes(String(job?.status || ""));
+  const total = completed ? Math.max(rawTotal, rawProcessed) : rawTotal || rawProcessed;
+  const processed = completed
+    ? total
+    : Math.min(total || rawProcessed, rawProcessed);
+  return { processed, total };
+}
+
 function loadAiConfig(key: string, fallback: AiConfig, legacy = false) {
   try {
     const saved = localStorage.getItem(key) || (legacy ? localStorage.getItem("highlight-ai-provider") : "");
@@ -1584,11 +1595,10 @@ function App() {
     ? Math.min(100, Math.round(((ingestProgress.uploadedFiles + ingestProgress.processedFiles) / Math.max(1, ingestProgress.totalFiles * 2)) * 100))
     : Math.min(100, Math.round((uploadBytes / Math.max(1, ingestProgress?.totalBytes || selectedBytes)) * 50));
   const ingestEta = ingestProgress?.etaSeconds ? formatTime(Math.max(0, Math.round(ingestProgress.etaSeconds))) : null;
-  const fastIndexPercent = fastIndexJob
-    ? Math.min(100, Math.round((fastIndexJob.processedFiles / Math.max(1, fastIndexJob.totalFiles)) * 100))
-    : project?.fastIndex?.totalFiles
-      ? Math.min(100, Math.round(((project.fastIndex.processedFiles || 0) / Math.max(1, project.fastIndex.totalFiles)) * 100))
-      : 0;
+  const fastIndexCounts = normalizedFastIndexCounts(fastIndexJob || project?.fastIndex);
+  const fastIndexPercent = fastIndexCounts.total
+    ? Math.min(100, Math.round((fastIndexCounts.processed / Math.max(1, fastIndexCounts.total)) * 100))
+    : 0;
   const fastIndexEta = fastIndexJob?.etaSeconds
     ? formatTime(Math.max(0, Math.round(fastIndexJob.etaSeconds)))
     : project?.fastIndex?.etaSeconds
@@ -1737,7 +1747,7 @@ function App() {
   const backgroundMessage = folderImportActive
     ? `${Math.min(ingestProgress?.processedFiles || 0, ingestProgress?.totalFiles || project?.files.length || 0)} of ${ingestProgress?.totalFiles || project?.files.length || 0} files analyzed${ingestProgress?.status === "paused" ? " · progress saved" : ""}`
     : ["processing", "paused"].includes(fastIndexStatus)
-      ? `${Math.min(authoritativeFastIndex?.processedFiles || 0, authoritativeFastIndex?.totalFiles || project?.files.length || 0)} of ${authoritativeFastIndex?.totalFiles || project?.files.length || 0} indexed${fastIndexStatus === "paused" ? " · progress saved" : ""}`
+      ? `${fastIndexCounts.processed} of ${fastIndexCounts.total || project?.files.length || 0} indexed${fastIndexStatus === "paused" ? " · progress saved" : ""}`
       : preprocessJob && ["processing", "paused"].includes(preprocessJob.status)
         ? `${folderVideosChecked} of ${folderVideosTotal} videos checked${preprocessJob.status === "paused" ? " - progress saved" : ""}`
         : visionReviewIncomplete
@@ -2413,7 +2423,7 @@ function App() {
                 </div>
               </div>
               <div className="preprocess-metrics">
-                <span><strong>{fastIndexEstimate ? `${fastIndexEstimate.files}/${fastIndexEstimate.totalProjectFiles}` : project?.fastIndex ? `${project.fastIndex.processedFiles || 0}/${project.fastIndex.totalFiles || 0}` : "..."}</strong> files</span>
+                <span><strong>{fastIndexEstimate ? `${fastIndexEstimate.files}/${fastIndexEstimate.totalProjectFiles}` : project?.fastIndex ? `${fastIndexCounts.processed}/${fastIndexCounts.total}` : "..."}</strong> files</span>
                 <span><strong>{fastIndexEstimate?.concurrency ?? fastIndexJob?.concurrency ?? 3}</strong> workers</span>
                 <span><strong>{fastIndexEta || "..."}</strong> estimate</span>
                 <span><strong>{fastIndexEstimate ? formatBytes(fastIndexEstimate.storageBytes) : "small"}</strong> index storage</span>
@@ -2424,7 +2434,7 @@ function App() {
                 <>
                   <div className="progress determinate preprocess-progress"><span style={{ width: `${Math.max(2, fastIndexPercent)}%` }} /></div>
                   <div className="preprocess-live">
-                    <span>{fastIndexJob?.processedFiles ?? project?.fastIndex?.processedFiles ?? 0}/{fastIndexJob?.totalFiles ?? project?.fastIndex?.totalFiles ?? 0} files scanned</span>
+                    <span>{fastIndexCounts.processed}/{fastIndexCounts.total} files scanned</span>
                     <span>{fastIndexJob?.candidateWindows ?? project?.fastIndex?.candidateWindows ?? 0} candidate windows</span>
                     <span>{fastIndexJob?.currentFile || project?.fastIndex?.phase || "background index"}</span>
                     <span>{fastIndexEta || "Estimating"} remaining</span>

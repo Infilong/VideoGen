@@ -114,6 +114,7 @@ export interface FastIndexJob {
   maxWindowsPerFile: number;
   createdAt: string;
   updatedAt: string;
+  completedAt?: string;
   result?: { project: Project; candidateWindows: number } | null;
   activeFiles?: string[];
 }

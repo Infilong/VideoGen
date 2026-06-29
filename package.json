@@ -17,6 +17,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "start": "node server/index.mjs",
+    "ai:coverage": "node scripts/check-ai-coverage.mjs",
     "test": "vitest run",
     "verify": "npm run build && npm test && node --check server/index.mjs && node --check server/media.mjs"
   },

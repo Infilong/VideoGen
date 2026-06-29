@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PreprocessJob, Project } from "./types";
-import App, { chooseDiversifiedClips } from "./App";
+import App, { chooseDiversifiedClips, highlightReviewCandidates } from "./App";
 import * as api from "./services/api";
 
 const savedFolderProject = vi.hoisted(() => ({
@@ -86,7 +86,8 @@ const generationProject = {
       duration: Number(savedFolderProject.files[index % savedFolderProject.files.length].metadata?.duration || 12),
       semanticScore: 88 - index,
       semanticFramesReviewed: 8,
-      semanticEvents: [{ start: 4, end: 10, score: 88 - index, state: "impact", action: "test impact", storyRole: "payoff", cutRisk: "high", payoffVerified: true }]
+      semanticEvents: [{ start: 4, end: 10, score: 88 - index, state: "impact", action: "test impact", storyRole: "payoff", cutRisk: "high", payoffVerified: true }],
+      confirmedHighlightMoments: [{ start: 4, end: 10, duration: 6, score: 88 - index, state: "impact", action: "test impact", storyRole: "payoff", source: "vision-verified", confirmedAt: "2026-06-28T00:00:00.000Z" }]
     }
   })),
   assets: [],
@@ -97,6 +98,7 @@ vi.mock("./services/api", () => ({
   addAssets: vi.fn(),
   cancelRenderJob: vi.fn(),
   checkAiModel: vi.fn(),
+  confirmHighlightMoment: vi.fn(),
   deleteProject: vi.fn(),
   estimateFastIndex: vi.fn().mockResolvedValue({
     files: 2,
@@ -143,6 +145,7 @@ vi.mock("./services/api", () => ({
   })),
   listProjects: vi.fn().mockResolvedValue([savedFolderProject]),
   localMediaUrl: vi.fn((url: string) => url),
+  markHighlightReviewed: vi.fn(),
   reconcileProject: vi.fn().mockResolvedValue(savedFolderProject),
   cancelPreprocessJob: vi.fn(),
   pauseFastIndexJob: vi.fn(),
@@ -152,6 +155,8 @@ vi.mock("./services/api", () => ({
   renderDraft: vi.fn(),
   requestAdvancedAdvice: vi.fn(),
   requestVisionReview: vi.fn(),
+  rejectHighlightMoment: vi.fn(),
+  removeHighlightConfirmation: vi.fn(),
   reviewDraft: vi.fn(),
   runFastIndex: vi.fn(),
   runPreprocess: vi.fn(),
@@ -160,11 +165,12 @@ vi.mock("./services/api", () => ({
 
 describe("path management", () => {
   beforeEach(() => {
+    window.history.pushState(null, "", "/");
     localStorage.clear();
     vi.clearAllMocks();
   });
 
-  it("changes diversified AI picks on consecutive clicks when alternatives exist", () => {
+  it("changes diversified lucky selections on consecutive clicks when alternatives exist", () => {
     const files = Array.from({ length: 20 }, (_, index) => ({
       ...savedFolderProject.files[index % savedFolderProject.files.length],
       id: `lucky-${index}`,
@@ -183,6 +189,143 @@ describe("path management", () => {
     expect(second).toHaveLength(12);
     expect(second).not.toEqual(first);
     expect(second.some((id) => !first.includes(id))).toBe(true);
+  });
+
+  it("does not requeue clips with confirmed highlight moments for manual review", () => {
+    const file = {
+      ...savedFolderProject.files[0],
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 40,
+        semanticEvents: [
+          { start: 4, end: 10, score: 88, state: "impact", action: "old pick", storyRole: "payoff", payoffVerified: true },
+          { start: 18, end: 27, score: 82, state: "impact", action: "new pick", storyRole: "payoff", payoffVerified: true }
+        ],
+        confirmedHighlightMoments: [{ start: 3.8, end: 10.2, duration: 6.4, score: 88, action: "old pick", storyRole: "payoff", source: "vision-verified", confirmedAt: "2026-06-28T00:00:00.000Z" }]
+      }
+    } as Project["files"][number];
+
+    const candidates = highlightReviewCandidates(file);
+
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("does not create manual review candidates for clips already marked reviewed", () => {
+    const file = {
+      ...savedFolderProject.files[0],
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 40,
+        reviewed: true,
+        semanticEvents: [],
+        semanticCandidateHistory: [
+          { start: 8, end: 16, score: 88, state: "impact", action: "already reviewed moment", storyRole: "payoff", payoffVerified: false }
+        ],
+        candidateWindows: [{ start: 18, end: 28, duration: 10, score: 92, reason: "audio_peak", sceneChanges: 5, audioPeak: -8, storyRole: "payoff", cutRisk: "high" }]
+      }
+    } as Project["files"][number];
+
+    expect(highlightReviewCandidates(file)).toHaveLength(0);
+  });
+
+  it("creates a manual review fallback for AI uncertain clips without candidate windows", () => {
+    const file = {
+      ...savedFolderProject.files[0],
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 60,
+        semanticScore: 42,
+        semanticFramesReviewed: 8,
+        semanticReviewVersion: 2,
+        semanticFineReviewed: true,
+        semanticEvents: [],
+        semanticCandidateHistory: [],
+        candidateWindows: []
+      }
+    } as Project["files"][number];
+
+    const candidates = highlightReviewCandidates(file);
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      source: "ai-uncertain",
+      label: "AI uncertain",
+      action: "manual review needed"
+    });
+  });
+
+  it("uses local highlight timing when weak Vision timing points at the wrong frame", () => {
+    const file = {
+      ...savedFolderProject.files[0],
+      id: "short-payoff",
+      name: "Battlefield 6 2026.06.10 - 23.09.50.27.DVR.mp4",
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 90.6,
+        highlightStart: 60.4,
+        semanticTopFrame: 33.2,
+        semanticFramesReviewed: 16,
+        semanticReviewVersion: 2,
+        semanticFineReviewed: true,
+        semanticQuality: "missed",
+        semanticScore: 4,
+        ratingConfidence: "low",
+        indexScore: 30,
+        actionScore: 6.8,
+        aiDecision: "confirmed",
+        semanticEvents: [],
+        semanticCandidateHistory: [],
+        candidateWindows: []
+      }
+    } as Project["files"][number];
+
+    const candidates = highlightReviewCandidates(file);
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      source: "local-signal",
+      label: "Local signal",
+      action: "local highlight signal"
+    });
+    expect(candidates[0].start).toBeGreaterThanOrEqual(55);
+    expect(candidates[0].start).toBeLessThan(58);
+    expect(candidates[0].end).toBeGreaterThan(60);
+  });
+
+  it("shows sustained local signals as polished review envelopes", () => {
+    const file = {
+      ...savedFolderProject.files[0],
+      id: "sustained-payoff",
+      name: "Battlefield 6 2026.06.14 - 00.20.26.13.DVR.mp4",
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 90.006521,
+        highlightStart: 57.806125,
+        semanticTopFrame: 16.2,
+        semanticFramesReviewed: 16,
+        semanticReviewVersion: 2,
+        semanticFineReviewed: true,
+        semanticQuality: "missed",
+        semanticScore: 0,
+        ratingConfidence: "low",
+        indexScore: 32,
+        actionScore: 22.4,
+        aiDecision: "confirmed",
+        semanticEvents: [],
+        semanticCandidateHistory: [],
+        candidateWindows: []
+      }
+    } as Project["files"][number];
+
+    const candidates = highlightReviewCandidates(file);
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      source: "local-signal",
+      label: "Local signal"
+    });
+    expect(candidates[0].start).toBe(60);
+    expect(candidates[0].end).toBeCloseTo(84, 1);
   });
 
   it("shows saved paths and loads a path's contents when clicked", async () => {
@@ -252,6 +395,491 @@ describe("path management", () => {
     expect(screen.queryByText("AI pending")).not.toBeInTheDocument();
   });
 
+  it("lets users trim and confirm selected highlight periods before generation", async () => {
+    const reviewProject = {
+      ...savedFolderProject,
+      id: "review-folder",
+      name: "Review Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "review-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [],
+          semanticCandidateHistory: [{ start: 8, end: 18, score: 90, state: "aim", action: "tank duel", storyRole: "payoff", payoffVerified: false }],
+          candidateWindows: [{ start: 20, end: 30, duration: 10, score: 80, reason: "audio_peak", sceneChanges: 4, audioPeak: -8, storyRole: "payoff", cutRisk: "high" }]
+        }
+      }]
+    } as Project;
+    const confirmedProject = {
+      ...reviewProject,
+      files: reviewProject.files.map((file) => ({
+        ...file,
+        metadata: {
+          ...file.metadata,
+          confirmedHighlightMoments: [{ start: 9, end: 16, duration: 7, score: 72, action: "tank duel", storyRole: "payoff", source: "vision-candidate", confirmedAt: "2026-06-28T00:00:00.000Z" }]
+        }
+      }))
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValueOnce(confirmedProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Review Folder/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+    expect(reviewButton).toBeEnabled();
+
+    fireEvent.click(reviewButton);
+    expect(await screen.findByText("Review page")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/review");
+    fireEvent.change(screen.getByLabelText("Trim start"), { target: { value: "9" } });
+    fireEvent.change(screen.getByLabelText("Trim end"), { target: { value: "16" } });
+    fireEvent.click(screen.getByRole("button", { name: /Agree, use it/i }));
+
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.confirmHighlightMoment).mock.calls[0][2]).toMatchObject({
+      start: 9,
+      end: 16,
+      source: "vision-candidate"
+    });
+    expect(await screen.findByText(/1 of 2 reviewed .* 1 agreed/)).toBeInTheDocument();
+    expect(await screen.findByText(/1 saved/)).toBeInTheDocument();
+    expect(screen.getAllByText(/00:09-00:16/).length).toBeGreaterThan(0);
+  });
+
+  it("reviews all AI uncertain candidates even when they are not selected", async () => {
+    const selectedFiles = Array.from({ length: 12 }, (_, index) => ({
+      ...savedFolderProject.files[index % savedFolderProject.files.length],
+      id: `selected-${index}`,
+      name: `selected-${index}.mp4`,
+      metadata: {
+        ...savedFolderProject.files[index % savedFolderProject.files.length].metadata,
+        duration: 30,
+        indexScore: 100 - index,
+        semanticScore: 0,
+        semanticEvents: [],
+        semanticCandidateHistory: []
+      }
+    }));
+    const uncertainFile = {
+      ...savedFolderProject.files[0],
+      id: "uncertain-manual-review",
+      name: "uncertain-manual-review.mp4",
+      metadata: {
+        ...savedFolderProject.files[0].metadata,
+        duration: 45,
+        indexScore: 1,
+        semanticScore: 48,
+        semanticFramesReviewed: 10,
+        semanticReviewVersion: 2,
+        semanticFineReviewed: true,
+        semanticEvents: [],
+        semanticCandidateHistory: [{ start: 11, end: 24, score: 58, state: "impact", action: "uncertain tank hit", storyRole: "payoff", payoffVerified: false }]
+      }
+    };
+    const uncertainProject = {
+      ...savedFolderProject,
+      id: "uncertain-folder",
+      name: "Uncertain Folder",
+      files: [...selectedFiles, uncertainFile]
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([uncertainProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(uncertainProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(uncertainProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Uncertain Folder/i }));
+
+    expect(await screen.findByText("0", { selector: ".selected-count strong" })).toBeInTheDocument();
+    const uncertainCheckbox = await screen.findByRole("checkbox", { name: /Select uncertain-manual-review\.mp4/i });
+    expect(uncertainCheckbox).not.toBeChecked();
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+
+    fireEvent.click(reviewButton);
+
+    expect(await screen.findByText("Review page")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "uncertain-manual-review" })).toBeInTheDocument();
+    expect(screen.getByText(/0 of 1 reviewed .* Part 1 of 1/)).toBeInTheDocument();
+  });
+
+  it("pauses play period at the selected end time", async () => {
+    const playMock = vi.spyOn(window.HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const pauseMock = vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const reviewProject = {
+      ...savedFolderProject,
+      id: "play-period-folder",
+      name: "Play Period Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "play-period-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [{ start: 6, end: 14, score: 83, state: "impact", action: "vehicle hit", storyRole: "payoff", payoffVerified: true }]
+        }
+      }]
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Play Period Folder/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+
+    fireEvent.click(reviewButton);
+    const video = await waitFor(() => {
+      const element = document.querySelector("video");
+      if (!element) throw new Error("Video preview did not render");
+      return element as HTMLVideoElement;
+    });
+    fireEvent.change(screen.getByLabelText("Trim end"), { target: { value: "18" } });
+    expect(video.currentTime).toBe(18);
+    fireEvent.change(screen.getByLabelText("Trim start"), { target: { value: "7" } });
+    expect(video.currentTime).toBe(7);
+    fireEvent.click(screen.getByRole("button", { name: /^Play period$/i }));
+    await waitFor(() => expect(playMock).toHaveBeenCalled());
+    video.currentTime = 18;
+    fireEvent.timeUpdate(video);
+
+    expect(pauseMock).toHaveBeenCalled();
+    expect(video.currentTime).toBe(18);
+    playMock.mockRestore();
+    pauseMock.mockRestore();
+  });
+
+  it("lets users reconfirm a wrongly confirmed highlight period", async () => {
+    const confirmedProject = {
+      ...savedFolderProject,
+      id: "reconfirm-folder",
+      name: "Reconfirm Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "reconfirm-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [{ start: 4, end: 10, score: 82, state: "impact", action: "old pick", storyRole: "payoff", payoffVerified: true }],
+          confirmedHighlightMoments: [{ start: 4, end: 10, duration: 6, score: 82, action: "old pick", storyRole: "payoff", source: "vision-verified", confirmedAt: "2026-06-28T00:00:00.000Z" }]
+        }
+      }]
+    } as Project;
+    const updatedProject = {
+      ...confirmedProject,
+      files: confirmedProject.files.map((file) => ({
+        ...file,
+        metadata: {
+          ...file.metadata,
+          confirmedHighlightMoments: [{ start: 18, end: 27, duration: 9, score: 82, action: "old pick", storyRole: "payoff", source: "vision-verified", confirmedAt: "2026-06-28T00:10:00.000Z" }]
+        }
+      }))
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([confirmedProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(confirmedProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(confirmedProject);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValueOnce(updatedProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Reconfirm Folder/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+
+    fireEvent.click(reviewButton);
+    expect(await screen.findByText(/1 saved/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Reconfirm$/i }));
+    fireEvent.change(screen.getByLabelText("Trim start"), { target: { value: "18" } });
+    fireEvent.change(screen.getByLabelText("Trim end"), { target: { value: "27" } });
+    fireEvent.click(screen.getByRole("button", { name: /Confirmed/i }));
+
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.confirmHighlightMoment).mock.calls[0][2]).toMatchObject({
+      start: 18,
+      end: 27
+    });
+    expect((await screen.findAllByText(/00:18-00:27/)).length).toBeGreaterThan(0);
+  });
+
+  it("reviews planned cuts before rendering selected AI periods", async () => {
+    const reviewProject = {
+      ...savedFolderProject,
+      id: "needs-confirmation-folder",
+      name: "Needs Confirmation",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "needs-confirmation-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [{ start: 5, end: 14, score: 81, state: "impact", action: "rocket hit", storyRole: "payoff", payoffVerified: true }]
+        }
+      }]
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(reviewProject);
+    const draft = {
+      id: "auto-uncertain-draft",
+      title: "Auto Uncertain Highlight",
+      description: "Generated from reviewed moments",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 88,
+      moments: 3,
+      version: 1,
+      music: "Game audio only",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      segments: [{ fileId: "needs-confirmation-clip", start: 3, duration: 12, score: 81, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
+    vi.mocked(api.renderDraft).mockResolvedValueOnce({
+      draft: { ...draft, exportUrl: "/media/exports/auto.mp4", exportPath: "D:\\exports\\auto.mp4", status: "exported" },
+      url: "/media/exports/auto.mp4",
+      localPath: "D:\\exports\\auto.mp4"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Needs Confirmation/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const generateAction = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /^Generate video$/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Generate video button is still disabled");
+      return enabled;
+    });
+    fireEvent.click(generateAction);
+
+    await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    expect(window.location.pathname).toBe("/review");
+    expect(api.renderDraft).not.toHaveBeenCalled();
+    fireEvent.change(await screen.findByLabelText("Trim start"), { target: { value: "8" } });
+    fireEvent.change(screen.getByLabelText("Trim end"), { target: { value: "11" } });
+    fireEvent.click(screen.getByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.confirmHighlightMoment).mock.calls[0][2]).toMatchObject({
+      start: 8,
+      end: 11,
+      replaceStart: 3,
+      replaceEnd: 15
+    });
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.updateDraft).mock.calls[0][2]).toMatchObject({
+      segments: [expect.objectContaining({ fileId: "needs-confirmation-clip", start: 8, duration: 3 })]
+    });
+    await waitFor(() => expect(api.renderDraft).toHaveBeenCalled());
+  });
+
+  it("does not ask users to re-approve planned cuts from clips already marked reviewed", async () => {
+    const reviewedProject = {
+      ...savedFolderProject,
+      id: "already-reviewed-folder",
+      name: "Already Reviewed",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "already-reviewed-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          reviewed: true,
+          reviewedAt: "2026-06-29T00:00:00.000Z",
+          semanticEvents: [{ start: 5, end: 14, score: 81, state: "impact", action: "rocket hit", storyRole: "payoff", payoffVerified: true }]
+        }
+      }]
+    } as Project;
+    const draft = {
+      id: "already-reviewed-draft",
+      title: "Already Reviewed Highlight",
+      description: "Generated from reviewed moments",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 88,
+      moments: 1,
+      version: 1,
+      music: "Game audio only",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      fileIds: ["already-reviewed-clip"],
+      segments: [{ fileId: "already-reviewed-clip", start: 5, duration: 9, score: 81, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewedProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewedProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewedProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
+    vi.mocked(api.renderDraft).mockResolvedValueOnce({
+      draft: { ...draft, exportUrl: "/media/exports/reviewed.mp4", exportPath: "D:\\exports\\reviewed.mp4", status: "exported" },
+      url: "/media/exports/reviewed.mp4",
+      localPath: "D:\\exports\\reviewed.mp4"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Already Reviewed/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const generateAction = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /^Generate video$/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Generate video button is still disabled");
+      return enabled;
+    });
+    fireEvent.click(generateAction);
+
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    expect(api.confirmHighlightMoment).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.updateDraft).mock.calls[0][2]).toMatchObject({
+      reviewedFileIds: ["already-reviewed-clip"],
+      segments: [expect.objectContaining({ fileId: "already-reviewed-clip", start: 5, duration: 9 })]
+    });
+    await waitFor(() => expect(api.renderDraft).toHaveBeenCalled());
+  });
+
+  it("marks skipped candidates reviewed so they are not shown again", async () => {
+    const reviewProject = {
+      ...savedFolderProject,
+      id: "skip-folder",
+      name: "Skip Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "skip-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [],
+          semanticCandidateHistory: [
+            { start: 5, end: 12, score: 92, state: "aim", action: "first candidate", storyRole: "payoff", payoffVerified: false },
+            { start: 20, end: 28, score: 84, state: "impact", action: "second candidate", storyRole: "payoff", payoffVerified: false }
+          ]
+        }
+      }]
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.markHighlightReviewed).mockResolvedValueOnce({
+      ...reviewProject,
+      files: reviewProject.files.map((file) => ({
+        ...file,
+        metadata: { ...file.metadata, reviewed: true, reviewedAt: "2026-06-29T00:00:00.000Z" }
+      }))
+    } as Project);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Skip Folder/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+
+    fireEvent.click(reviewButton);
+    expect(await screen.findByText(/0 of 2 reviewed .* Part 1 of 2/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Skip this time/i }));
+
+    await waitFor(() => expect(api.markHighlightReviewed).toHaveBeenCalledWith("skip-folder", "skip-clip", true));
+    expect(api.rejectHighlightMoment).not.toHaveBeenCalled();
+    expect(await screen.findByText(/1 of 2 reviewed/)).toBeInTheDocument();
+  });
+
+  it("can permanently reject a period as not a highlight", async () => {
+    const reviewProject = {
+      ...savedFolderProject,
+      id: "reject-folder",
+      name: "Reject Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        id: "reject-clip",
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          duration: 40,
+          semanticEvents: [],
+          semanticCandidateHistory: [{ start: 8, end: 18, score: 90, state: "aim", action: "not good", storyRole: "payoff", payoffVerified: false }]
+        }
+      }]
+    } as Project;
+    const rejectedProject = {
+      ...reviewProject,
+      files: reviewProject.files.map((file) => ({
+        ...file,
+        metadata: {
+          ...file.metadata,
+          semanticCandidateHistory: [],
+          rejectedHighlightMoments: [{ start: 8, end: 18, duration: 10, reason: "not-highlight", source: "vision-candidate", rejectedAt: "2026-06-28T00:00:00.000Z" }]
+        }
+      }))
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewProject);
+    vi.mocked(api.rejectHighlightMoment).mockResolvedValueOnce(rejectedProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Reject Folder/i }));
+    const checkbox = await screen.findByRole("checkbox", { name: /Select first-highlight/i });
+    fireEvent.change(checkbox, { target: { checked: true } });
+    await waitFor(() => expect(checkbox).toBeChecked());
+    const reviewButton = await waitFor(() => {
+      const enabled = screen.getAllByRole("button", { name: /Review moments/i }).find((button) => !button.hasAttribute("disabled"));
+      if (!enabled) throw new Error("Review moments button is still disabled");
+      return enabled;
+    });
+
+    fireEvent.click(reviewButton);
+    expect(await screen.findByText("Review page")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Not a highlight/i }));
+
+    await waitFor(() => expect(api.rejectHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.rejectHighlightMoment).mock.calls[0][2]).toMatchObject({
+      start: 8,
+      end: 18,
+      reason: "not-highlight"
+    });
+    expect(await screen.findByText("No active candidate")).toBeInTheDocument();
+    expect(await screen.findByText(/This period will not be shown or used again/)).toBeInTheDocument();
+  });
+
   it("labels strong AI-reviewed clips as AI verified even without event details", async () => {
     const strongProject = {
       ...savedFolderProject,
@@ -284,6 +912,33 @@ describe("path management", () => {
     expect(await screen.findByText("AI verified 77")).toBeInTheDocument();
     expect(screen.queryByText("Verified AI 77")).not.toBeInTheDocument();
     expect(screen.getAllByTitle("Vision AI verified a complete visible payoff").length).toBeGreaterThan(0);
+  });
+
+  it("shows a user verified label for clips the user already reviewed", async () => {
+    const reviewedProject = {
+      ...savedFolderProject,
+      id: "user-verified-folder",
+      name: "User Verified Folder",
+      files: [{
+        ...savedFolderProject.files[0],
+        metadata: {
+          ...savedFolderProject.files[0].metadata,
+          reviewed: true,
+          semanticScore: 86,
+          semanticQuality: "verified" as const,
+          semanticEvents: [{ start: 3, end: 9, score: 86, state: "impact", action: "verified event", payoffVerified: true }]
+        }
+      }]
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([reviewedProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(reviewedProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(reviewedProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /User Verified Folder/i }));
+
+    expect(await screen.findByText("user verified")).toBeInTheDocument();
+    expect(screen.getByTitle("You already reviewed this clip. HighlightAI will not ask you to review it again.")).toBeInTheDocument();
   });
 
   it("shows one truthful background service card for a paused index job", async () => {
@@ -565,7 +1220,7 @@ describe("path management", () => {
 
     await waitFor(() => expect(api.runPreprocess).toHaveBeenCalledTimes(2));
     expect(screen.queryByText(/still need Vision AI review/i)).not.toBeInTheDocument();
-    expect(await screen.findByText("AI uncertain 75")).toBeInTheDocument();
+    expect(await screen.findByText("AI verified 75")).toBeInTheDocument();
   });
 
   it("saves AI resource limits and applies them to background Vision AI jobs", async () => {
@@ -863,6 +1518,37 @@ describe("path management", () => {
     expect(screen.queryByRole("button", { name: "Version 1" })).not.toBeInTheDocument();
   });
 
+  it("uses a finite show-more control instead of a stuck loading state at the end of clip paging", async () => {
+    const largeProject = {
+      ...savedFolderProject,
+      id: "large-library",
+      name: "Large Library",
+      files: Array.from({ length: 45 }, (_, index) => ({
+        ...savedFolderProject.files[index % savedFolderProject.files.length],
+        id: `large-clip-${index + 1}`,
+        name: `large-clip-${index + 1}.mp4`,
+        metadata: {
+          ...savedFolderProject.files[index % savedFolderProject.files.length].metadata,
+          duration: 20 + index,
+          indexScore: 100 - index
+        }
+      }))
+    } as Project;
+    vi.mocked(api.listProjects).mockResolvedValueOnce([largeProject]);
+    vi.mocked(api.getProject).mockResolvedValueOnce(largeProject);
+    vi.mocked(api.reconcileProject).mockResolvedValueOnce(largeProject);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Large Library/i }));
+
+    expect(await screen.findByText("Showing 40 of 45 clips")).toBeInTheDocument();
+    expect(screen.queryByText("Loading more clips...")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+
+    await waitFor(() => expect(screen.queryByLabelText("More clips available")).not.toBeInTheDocument());
+    expect(screen.queryByText("Loading more clips...")).not.toBeInTheDocument();
+  });
+
   it("allows more than 20 clips and treats low AI moment count as advice, not a blocker", async () => {
     const manyClipProject = {
       ...generationProject,
@@ -898,12 +1584,14 @@ describe("path management", () => {
       captionStyle: "Clean",
       intensity: 80,
       changes: [],
-      segments: []
+      segments: [{ fileId: "many-clip-1", start: 4, duration: 10, score: 88, source: "index", confidence: "high" as const }]
     };
     vi.mocked(api.listProjects).mockResolvedValueOnce([manyClipProject]);
     vi.mocked(api.getProject).mockResolvedValueOnce(manyClipProject);
     vi.mocked(api.reconcileProject).mockResolvedValue(manyClipProject);
     vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(manyClipProject);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
     vi.mocked(api.renderDraft).mockResolvedValueOnce({
       draft: { ...draft, exportUrl: "/media/exports/many.mp4", exportPath: "D:\\exports\\many.mp4", status: "exported" },
       url: "/media/exports/many.mp4",
@@ -915,12 +1603,17 @@ describe("path management", () => {
     await waitFor(() => expect(screen.getAllByText("Many Clip Project").length).toBeGreaterThan(1));
 
     fireEvent.click(screen.getByRole("button", { name: "Select all" }));
-    await waitFor(() => expect(screen.getByText("25 clips ready")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("25 selected clips ready")).toBeInTheDocument());
     expect(screen.getByLabelText("Advice for a better video")).toHaveTextContent("AI sees 1 verified highlight moment");
 
     fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
 
     await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    expect(api.renderDraft).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
     await waitFor(() => expect(api.renderDraft).toHaveBeenCalledTimes(1));
     const idea = vi.mocked(api.generateDraft).mock.calls[0][1];
     expect(idea.fileIds).toHaveLength(25);
@@ -942,11 +1635,13 @@ describe("path management", () => {
       captionStyle: "Clean",
       intensity: 80,
       changes: [],
-      segments: []
+      segments: [{ fileId: "generation-clip-1", start: 4, duration: 6, score: 90, source: "vision", confidence: "high" as const }]
     };
     vi.mocked(api.getProject).mockResolvedValueOnce(generationProject);
     vi.mocked(api.reconcileProject).mockResolvedValue(generationProject);
     vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(generationProject);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
     vi.mocked(api.renderDraft).mockResolvedValueOnce({
       draft: { ...draft, exportUrl: "/media/exports/generated.mp4", exportPath: "D:\\exports\\generated.mp4", status: "exported" },
       url: "/media/exports/generated.mp4",
@@ -961,6 +1656,12 @@ describe("path management", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
 
     await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    expect(api.renderDraft).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(api.renderDraft).toHaveBeenCalled());
     expect(vi.mocked(api.renderDraft).mock.calls[0][2]).toBeUndefined();
     expect(await screen.findByText("Your video is ready")).toBeInTheDocument();
@@ -972,5 +1673,242 @@ describe("path management", () => {
     fireEvent.click(screen.getByRole("button", { name: "Preview Generated Highlight" }));
     expect(await screen.findByText("Generated video")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Version/i })).not.toBeInTheDocument();
+  });
+
+  it("asks users to add more clips when the selected soundtrack is longer than the source clips", async () => {
+    const shortMusicProject = {
+      ...generationProject,
+      assets: [{
+        id: "long-music",
+        name: "long-theme.flac",
+        size: 1234,
+        type: "audio" as const,
+        source: "local-asset" as const,
+        url: "/media/uploads/long-theme.flac",
+        duration: 100
+      }]
+    } as Project;
+    const draft = {
+      id: "short-source-draft",
+      title: "Short Source Highlight",
+      description: "Test generated highlight",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 90,
+      moments: 5,
+      version: 1,
+      music: "long-theme.flac",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      segments: [{ fileId: "generation-clip-1", start: 4, duration: 6, score: 90, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.getProject).mockResolvedValueOnce(shortMusicProject);
+    vi.mocked(api.reconcileProject).mockResolvedValue(shortMusicProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Saved Folder/i }));
+    await screen.findByText("Generation Project");
+
+    fireEvent.change(screen.getByLabelText("Choose music (optional)"), { target: { value: "long-music" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
+
+    expect(await screen.findByRole("alert", { name: "Add more clips for selected music" })).toBeInTheDocument();
+    expect(screen.getByText(/total 01:12, but long-theme\.flac needs 01:40/i)).toBeInTheDocument();
+    expect(api.generateDraft).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate anyway" }));
+    await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+  });
+
+  it("asks users to add more reviewed parts when approved highlight duration is shorter than the soundtrack", async () => {
+    const musicProject = {
+      ...generationProject,
+      assets: [{
+        id: "review-music",
+        name: "review-theme.flac",
+        size: 1234,
+        type: "audio" as const,
+        source: "local-asset" as const,
+        url: "/media/uploads/review-theme.flac",
+        duration: 60
+      }]
+    } as Project;
+    const draft = {
+      id: "review-short-draft",
+      title: "Review Short Highlight",
+      description: "Test generated highlight",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 90,
+      moments: 5,
+      version: 1,
+      music: "review-theme.flac",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      segments: [{ fileId: "generation-clip-1", start: 4, duration: 6, score: 90, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.getProject).mockResolvedValueOnce(musicProject);
+    vi.mocked(api.reconcileProject).mockResolvedValue(musicProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(musicProject);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
+    vi.mocked(api.renderDraft).mockResolvedValueOnce({
+      draft: { ...draft, exportUrl: "/media/exports/review-short.mp4", exportPath: "D:\\exports\\review-short.mp4", status: "exported" },
+      url: "/media/exports/review-short.mp4",
+      localPath: "D:\\exports\\review-short.mp4"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Saved Folder/i }));
+    await screen.findByText("Generation Project");
+
+    fireEvent.change(screen.getByLabelText("Choose music (optional)"), { target: { value: "review-music" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
+
+    await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("alert", { name: "Add more reviewed parts for selected music" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Generate this reviewed video?" })).not.toBeInTheDocument();
+    expect(screen.getByText(/total 00:06, but review-theme\.flac needs 01:00/i)).toBeInTheDocument();
+    expect(api.updateDraft).not.toHaveBeenCalled();
+    expect(api.renderDraft).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate anyway" }));
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.renderDraft).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps approved parts and appends unique saved parts when adding more for music length", async () => {
+    const musicProject = {
+      ...generationProject,
+      assets: [{
+        id: "short-review-music",
+        name: "short-review-theme.flac",
+        size: 1234,
+        type: "audio" as const,
+        source: "local-asset" as const,
+        url: "/media/uploads/short-review-theme.flac",
+        duration: 10
+      }]
+    } as Project;
+    const draft = {
+      id: "review-append-draft",
+      title: "Review Append Highlight",
+      description: "Test generated highlight",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 90,
+      moments: 5,
+      version: 1,
+      music: "short-review-theme.flac",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      fileIds: ["generation-clip-1"],
+      segments: [{ fileId: "generation-clip-1", start: 4, duration: 6, score: 90, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.getProject).mockResolvedValueOnce(musicProject);
+    vi.mocked(api.reconcileProject).mockResolvedValue(musicProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(musicProject);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
+    vi.mocked(api.renderDraft).mockResolvedValueOnce({
+      draft: { ...draft, exportUrl: "/media/exports/review-append.mp4", exportPath: "D:\\exports\\review-append.mp4", status: "exported" },
+      url: "/media/exports/review-append.mp4",
+      localPath: "D:\\exports\\review-append.mp4"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Saved Folder/i }));
+    await screen.findByText("Generation Project");
+
+    fireEvent.change(screen.getByLabelText("Choose music (optional)"), { target: { value: "short-review-music" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
+
+    await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("alert", { name: "Add more reviewed parts for selected music" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add more parts" }));
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
+    const changes = vi.mocked(api.updateDraft).mock.calls[0][2] as unknown as { segments: Array<{ fileId: string }>; reviewedFileIds: string[] };
+    const segmentFileIds = changes.segments.map((segment) => segment.fileId);
+    expect(segmentFileIds).toContain("generation-clip-1");
+    expect(segmentFileIds.some((id) => id !== "generation-clip-1")).toBe(true);
+    expect(new Set(segmentFileIds).size).toBe(segmentFileIds.length);
+    expect(changes.reviewedFileIds).toEqual(expect.arrayContaining(segmentFileIds));
+    await waitFor(() => expect(api.renderDraft).toHaveBeenCalledTimes(1));
+  });
+
+  it("passes the double-music length option to render", async () => {
+    const musicProject = {
+      ...generationProject,
+      assets: [{
+        id: "music-asset",
+        name: "battle-theme.flac",
+        size: 1234,
+        type: "audio" as const,
+        source: "local-asset" as const,
+        url: "/media/uploads/battle-theme.flac"
+      }]
+    } as Project;
+    const draft = {
+      id: "repeat-draft",
+      title: "Repeat Music Highlight",
+      description: "Test generated highlight",
+      duration: 30,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 90,
+      moments: 5,
+      version: 1,
+      music: "battle-theme.flac",
+      captionStyle: "Clean",
+      intensity: 80,
+      changes: [],
+      segments: [{ fileId: "generation-clip-1", start: 4, duration: 6, score: 90, source: "vision", confidence: "high" as const }]
+    };
+    vi.mocked(api.getProject).mockResolvedValueOnce(musicProject);
+    vi.mocked(api.reconcileProject).mockResolvedValue(musicProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
+    vi.mocked(api.confirmHighlightMoment).mockResolvedValue(musicProject);
+    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
+    vi.mocked(api.renderDraft).mockResolvedValueOnce({
+      draft: { ...draft, exportUrl: "/media/exports/repeat.mp4", exportPath: "D:\\exports\\repeat.mp4", status: "exported" },
+      url: "/media/exports/repeat.mp4",
+      localPath: "D:\\exports\\repeat.mp4"
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Saved Folder/i }));
+    await screen.findByText("Generation Project");
+
+    fireEvent.change(screen.getByLabelText("Choose music (optional)"), { target: { value: "music-asset" } });
+    fireEvent.change(screen.getByLabelText("Video length"), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
+    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.renderDraft).toHaveBeenCalled());
+    expect(vi.mocked(api.renderDraft).mock.calls[0][2]).toBe("music-asset");
+    expect(vi.mocked(api.renderDraft).mock.calls[0][5]).toBe(2);
   });
 });

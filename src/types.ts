@@ -39,14 +39,22 @@ export interface RenderJob {
   kind: "render";
   projectId: string;
   draftId: string;
-  status: "queued" | "processing" | "paused" | "completed" | "cancelled" | "failed";
-  phase: "queued" | "directing" | "evaluating" | "aligning" | "rendering" | "compressing" | "paused" | "cancelled" | "completed" | "failed";
+  status: "queued" | "processing" | "paused" | "needs_review" | "completed" | "cancelled" | "failed";
+  phase: "queued" | "directing" | "evaluating" | "needs_review" | "aligning" | "rendering" | "compressing" | "paused" | "cancelled" | "completed" | "failed";
   progress: number;
   message: string;
   createdAt: string;
   updatedAt: string;
   result?: { url: string; localPath?: string; draft: Draft; assetManifest?: Record<string, unknown> };
   workflow?: EditWorkflow;
+  reviewRequest?: {
+    title: string;
+    message: string;
+    action: string;
+    problems: string[];
+    fileIds: string[];
+    segments: Segment[];
+  };
   error?: OperationIssue;
 }
 
@@ -149,6 +157,7 @@ export interface PreprocessJob {
   sampleInterval: number;
   maxFiles?: number;
   maxFrames?: number;
+  maxRuntimeSeconds?: number;
   refineReviewed?: boolean;
   fileIds?: string[] | null;
   estimatedSeconds: number;
@@ -179,6 +188,7 @@ export interface MediaAsset {
   type: "video" | "audio" | "image" | "other";
   source: "recording" | "local-asset" | "public";
   url?: string;
+  duration?: number;
   metadata?: MediaMetadata;
   sourceUrl?: string;
   creator?: string;
@@ -233,13 +243,21 @@ export interface MediaMetadata {
     clarity: number;
     obstruction: number;
     payoffExpected: boolean;
+    payoffVerified?: boolean;
   } | null;
   semanticTags?: string[];
   semanticEvents?: Array<{ start: number; end: number; score: number; state: string; action: string; payoffStage?: string; storyRole?: string; cutRisk?: string; payoffVerified?: boolean; impactTime?: number }>;
   semanticCandidateHistory?: Array<{ start: number; end: number; score: number; state: string; action: string; payoffStage?: string; storyRole?: string; cutRisk?: string; payoffVerified?: boolean; impactTime?: number }>;
+  confirmedHighlightMoments?: Array<{ start: number; end: number; duration: number; score: number; state?: string; action?: string; storyRole?: string; source?: string; confirmedAt: string }>;
+  rejectedHighlightMoments?: Array<{ start: number; end: number; duration: number; reason: "not-highlight"; source?: string; rejectedAt: string }>;
+  reviewed?: boolean;
+  reviewedAt?: string;
   semanticFineReviewed?: boolean;
   semanticIndexJobId?: string;
   semanticReviewLastError?: string | null;
+  aiDecision?: "confirmed" | "low_confidence" | "rejected" | "pending";
+  aiDecisionReason?: string;
+  aiDecisionUpdatedAt?: string;
   visionApproved?: boolean;
   visionScore?: number;
   candidateWindows?: Array<{ start: number; end: number; duration: number; score: number; reason: string; sceneChanges: number; audioPeak: number; storyRole: string; cutRisk: string }>;
@@ -261,6 +279,7 @@ export interface Segment {
   score: number;
   storyRole?: string;
   source?: string;
+  confidence?: "high" | "medium" | "low";
 }
 
 export interface VideoIdea {
@@ -296,6 +315,8 @@ export interface Draft extends VideoIdea {
     ending: string;
     syncPoints: number;
   };
+  musicDuration?: number;
+  musicRepeats?: number;
   encoding?: {
     codec: string;
     encoder: string;
@@ -337,10 +358,16 @@ export interface EditWorkflow {
   };
   visualReview?: {
     score: number;
+    rawScore?: number;
     approved: boolean;
     rejectSegmentIndexes: number[];
+    approvedSegmentIndexes?: number[];
+    trimSegmentEdits?: Array<{ segmentIndex: number; start: number; end: number; reason?: string }>;
+    trimmedSegments?: number;
+    rejectedByTrim?: number;
     problems: string[];
   };
+  visualReviewEditsApplied?: boolean;
   music?: Draft["musicPlan"] | null;
 }
 

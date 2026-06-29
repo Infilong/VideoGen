@@ -191,6 +191,89 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function intervalEnd(item) {
+  const start = Number(item?.start) || 0;
+  return Number(item?.end) || start + (Number(item?.duration) || 0);
+}
+
+function overlapsRejectedHighlight(metadata = {}, start = 0, end = start) {
+  return (metadata.rejectedHighlightMoments || []).some((item) =>
+    item?.reason === "not-highlight" &&
+    Math.max(Number(item.start) || 0, start) < Math.min(intervalEnd(item), end) - 0.75
+  );
+}
+
+function semanticSummaryEvidence(metadata = {}) {
+  const rating = metadata.semanticRating || {};
+  const traits = metadata.semanticTraits || {};
+  const reject = String(rating.excludeReason || "none").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "boring_travel", "walking", "waiting", "weak_aim", "unreadable", "duplicate"]);
+  if (hardRejects.has(reject)) return null;
+  if (Number(rating.boredom || 0) >= 60) return null;
+  if (Number(traits.clarity || 0) < 60) return null;
+  if (Number(traits.obstruction || 0) > 50) return null;
+  const text = `${traits.action || ""} ${metadata.semanticRejectReason || ""} ${(metadata.semanticTags || []).join(" ")}`.toLowerCase();
+  const score = Math.max(
+    Number(metadata.semanticScore || 0),
+    Number(rating.trailerUsefulness || 0),
+    Number(rating.excitement || 0),
+    Number(traits.intensity || 0),
+    Number(traits.spectacle || 0)
+  );
+  const explicitPayoff = traits.payoffVerified === true && Number(metadata.semanticScore || 0) >= 70;
+  const strongSemantic = Number(metadata.semanticScore || 0) >= 70
+    || (Number(rating.trailerUsefulness || 0) >= 70 && (Number(traits.intensity || 0) >= 70 || Number(traits.spectacle || 0) >= 70));
+  const decisiveText = /explosion|destroy|destruction|detonat|sniper|headshot|vehicle|air combat|shoot|shot|objective|capture|kill/i.test(text)
+    && Number(traits.intensity || 0) >= 70;
+  if (!explicitPayoff && !strongSemantic && !decisiveText) return null;
+  return {
+    score: clamp(Math.round(score || Number(metadata.indexScore || 0) || 64), 0, 100),
+    action: String(traits.action || rating.payoffStage || "strong AI candidate").slice(0, 100),
+    subject: String(traits.subject || "other").slice(0, 40),
+    state: explicitPayoff ? "impact" : String(rating.payoffStage || "impact").slice(0, 30),
+    storyRole: explicitPayoff ? "payoff" : "anticipation",
+    payoffVerified: explicitPayoff
+  };
+}
+
+function reliableFocusTime(metadata = {}) {
+  const semanticEvents = [...(metadata.semanticEvents || []), ...(metadata.semanticCandidateHistory || [])];
+  const weakVisionMiss = Number(metadata.semanticFramesReviewed || 0) > 0 &&
+    !semanticEvents.length &&
+    (metadata.ratingConfidence === "low" || metadata.semanticQuality === "missed" || Number(metadata.semanticScore || 0) < 25);
+  if (weakVisionMiss && Number.isFinite(Number(metadata.highlightStart))) return Number(metadata.highlightStart);
+  return Number(metadata.semanticTopFrame ?? metadata.highlightStart ?? metadata.duration / 2);
+}
+
+function localSignalCandidateEvidence(metadata = {}) {
+  if (!Number.isFinite(Number(metadata.highlightStart))) return null;
+  if ((metadata.semanticEvents || []).length || (metadata.semanticCandidateHistory || []).length || (metadata.candidateWindows || []).length) return null;
+  const indexScore = Number(metadata.indexScore || 0);
+  const actionScore = Number(metadata.actionScore || 0);
+  if (indexScore < 30 && actionScore < 20) return null;
+  return {
+    focus: Number(metadata.highlightStart),
+    score: clamp(Math.max(indexScore + 35, actionScore + 20, 62), 0, 76),
+    confidence: indexScore >= 45 || actionScore >= 60 ? "medium" : "low"
+  };
+}
+
+function localSignalCandidateWindow(metadata = {}, localSignal = {}) {
+  const sourceDuration = Number(metadata.duration || 0);
+  const focus = Number(localSignal.focus);
+  const sustainedSignal = localSignal.confidence === "low" &&
+    Number(metadata.indexScore || 0) >= 30 &&
+    Number(metadata.actionScore || 0) >= 15;
+  if (sustainedSignal) {
+    const duration = Math.min(24, Math.max(14, sourceDuration * 0.27 || 18));
+    const start = Math.max(0, Math.min(Math.max(0, sourceDuration - duration), Math.ceil(focus + 2)));
+    return { start, end: Math.min(sourceDuration || start + duration, start + duration), duration };
+  }
+  const duration = Math.min(12, Math.max(8, sourceDuration * 0.11 || 10));
+  const start = Math.max(0, Math.min((sourceDuration || duration) - duration, focus - duration * 0.45));
+  return { start, end: Math.min(sourceDuration || start + duration, start + duration), duration };
+}
+
 function parseRate(rate = "0/1") {
   const [a, b] = rate.split("/").map(Number);
   return b ? Math.round((a / b) * 10) / 10 : 0;
@@ -208,12 +291,15 @@ export function createSegments(files, targetDuration, intensity = 78) {
   const maxDuration = Math.min(MAX_DURATION, Math.max(15, Number(targetDuration) || 60));
   const segmentLength = intensity >= 88 ? 4 : intensity >= 75 ? 6 : 9;
   const candidates = [];
-  const rankedFiles = [...files].sort((a, b) => (b.metadata.actionScore || 0) - (a.metadata.actionScore || 0));
+  const rankedFiles = files
+    .filter(isUsableSourceForGeneration)
+    .sort((a, b) => (b.metadata.actionScore || 0) - (a.metadata.actionScore || 0));
   for (const file of rankedFiles) {
     const usable = Math.max(0, file.metadata.duration - segmentLength);
     const count = intensity >= 88 ? 1 : Math.max(1, Math.min(3, Math.floor(file.metadata.duration / 40)));
     for (let i = 0; i < count; i += 1) {
-      const preferredStart = file.metadata.highlightStart ?? usable * 0.66;
+      const focus = file.metadata.highlightStart ?? usable * 0.66;
+      const preferredStart = Math.max(0, focus - segmentLength * 0.55);
       const ratioStart = usable * ((i + 1) / (count + 1));
       candidates.push({
         fileId: file.id,
@@ -276,7 +362,7 @@ export function refineDraftPlan(draft, files, changes = {}) {
 export function createTrailerSegments(files, targetDuration = 150) {
   const limit = Math.min(MAX_DURATION, Math.max(45, Number(targetDuration) || 150));
   const contentLimit = limit;
-  const sourceFiles = files.filter((file) => !looksLikeGeneratedExport(file.name));
+  const sourceFiles = files.filter(isUsableSourceForGeneration);
   const semantic = sourceFiles.filter((file) => (file.metadata.semanticEvents || []).length && (file.metadata.semanticScore || 0) >= 60);
   const approved = sourceFiles.filter((file) => file.metadata.visionApproved !== false && (file.metadata.visionScore || 0) >= 70);
   const semanticPlan = semantic.length ? createSemanticTrailerSegments(semantic, limit, contentLimit) : { segments: [], duration: 0 };
@@ -308,7 +394,7 @@ export function createTrailerSegments(files, targetDuration = 150) {
     const focus = file.metadata.highlightStart ?? Math.max(0, file.metadata.duration - 16);
     selected.push({
       fileId: file.id,
-      start: Math.max(0, Math.min(file.metadata.duration - duration, focus)),
+      start: Math.max(0, Math.min(file.metadata.duration - duration, focus - duration * 0.45)),
       duration,
       score: file.metadata.actionScore || 50
     });
@@ -318,7 +404,7 @@ export function createTrailerSegments(files, targetDuration = 150) {
 }
 
 export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) {
-  const sourceFiles = files.filter((file) => !looksLikeGeneratedExport(file.name));
+  const sourceFiles = files.filter(isUsableSourceForGeneration);
   const hardRejectStates = new Set(["menu", "scoreboard", "map", "loading", "death"]);
   if (["military_fps", "battle_royale"].includes(options.gameGenre)) {
     ["walking", "waiting", "travel"].forEach((state) => hardRejectStates.add(state));
@@ -327,6 +413,7 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
   }
   const candidates = [];
   const rejected = [];
+  const reviewCandidateMinScore = Number(options.reviewCandidateMinScore ?? options.minScore ?? 64);
   const excludedIntervals = new Set(Array.isArray(options.excludedIntervals) ? options.excludedIntervals : []);
   const isExcluded = (candidate) => excludedIntervals.has(
     `${candidate.fileId}:${Math.round(candidate.start)}:${Math.round(candidate.duration)}`
@@ -337,9 +424,43 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
     const tags = [...new Set([...(metadata.semanticTags || []), ...(metadata.indexTags || [])])].slice(0, 6);
     const subject = metadata.semanticTraits?.subject || tags[0] || "other";
     const semanticEvents = metadata.semanticEvents || [];
+    const hasConfirmedMoments = (metadata.confirmedHighlightMoments || []).length > 0;
+    for (const moment of metadata.confirmedHighlightMoments || []) {
+      const start = Math.max(0, Number(moment.start) || 0);
+      const end = Math.min(metadata.duration || 0, Number(moment.end) || start + Number(moment.duration || 0));
+      if (overlapsRejectedHighlight(metadata, start, end)) {
+        rejected.push({ fileId: file.id, reason: "User rejected this confirmed interval as not a highlight" });
+        continue;
+      }
+      if (end - start < 1) {
+        rejected.push({ fileId: file.id, reason: "Confirmed highlight period is too short" });
+        continue;
+      }
+      const candidate = {
+        fileId: file.id,
+        start,
+        duration: end - start,
+        minDuration: Math.max(1, end - start),
+        score: clamp(Math.max(Number(moment.score) || 0, Number(metadata.semanticScore) || 0, Number(metadata.indexScore) || 0, 85) + 8, 0, 100),
+        storyRole: moment.storyRole || "payoff",
+        state: moment.state || "human-confirmed",
+        action: moment.action || metadata.semanticTraits?.action || "confirmed highlight",
+        subject,
+        tags,
+        confidence: "high",
+        impactTime: end,
+        source: "human-confirmed"
+      };
+      if (isExcluded(candidate)) rejected.push({ fileId: file.id, reason: "Visual reviewer rejected confirmed interval" });
+      else candidates.push(candidate);
+    }
     for (const event of semanticEvents) {
       const start = Math.max(0, Number(event.start) || 0);
       const end = Math.min(metadata.duration || 0, Number(event.end) || start + 6);
+      if (overlapsRejectedHighlight(metadata, start, end)) {
+        rejected.push({ fileId: file.id, reason: "User rejected this vision interval as not a highlight" });
+        continue;
+      }
       if (options.requireVerifiedVision && event.payoffVerified !== true) {
         rejected.push({ fileId: file.id, reason: "Legacy or incomplete vision event has no verified visible outcome" });
         continue;
@@ -398,6 +519,10 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
       for (const event of metadata.semanticCandidateHistory || []) {
         const start = Math.max(0, Number(event.start) || 0);
         const end = Math.min(metadata.duration || 0, Number(event.end) || start);
+        if (overlapsRejectedHighlight(metadata, start, end)) {
+          rejected.push({ fileId: file.id, reason: "User rejected this stored candidate as not a highlight" });
+          continue;
+        }
         const overlapsVerified = verifiedIntervals.some((interval) =>
           Math.max(interval.start, start) < Math.min(interval.end, end) - 1
         );
@@ -406,28 +531,96 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
           continue;
         }
         if (overlapsVerified || hardRejectStates.has(event.state) || end - start < 3.5) continue;
+        const rawScore = Number(event.score) || metadata.semanticScore || 60;
+        const confidence = event.payoffVerified === true
+          ? "high"
+          : rawScore >= 82 ? "medium" : rawScore >= 64 ? "medium" : "low";
+        if (allowWeakReviewCandidates && event.payoffVerified !== true && rawScore < reviewCandidateMinScore) {
+          rejected.push({ fileId: file.id, reason: "Weak stored candidate below auto-rank threshold" });
+          continue;
+        }
         const candidate = {
           fileId: file.id,
           start,
           duration: end - start,
           minDuration: Math.max(4, Math.min(end - start, (Number(event.impactTime) || end) - start + 3)),
-          score: clamp((Number(event.score) || metadata.semanticScore || 60) - 6, 0, 100),
+          score: clamp(rawScore - (event.payoffVerified === true ? 2 : 6), 0, 100),
           storyRole: event.storyRole || event.payoffStage || "anticipation",
           state: event.state || "other",
           action: event.action || metadata.semanticTraits?.action || "candidate gameplay payoff",
           subject,
           tags,
-          confidence: "medium",
+          confidence,
           impactTime: Number(event.impactTime) || end,
           source: "vision-candidate"
         };
         if (isExcluded(candidate)) rejected.push({ fileId: file.id, reason: "Visual reviewer rejected candidate interval" });
-        else candidates.push(candidate);
+          else candidates.push(candidate);
+      }
+
+      const hasPreciseCandidate = semanticEvents.length > 0
+        || (metadata.semanticCandidateHistory || []).length > 0
+        || (metadata.candidateWindows || []).length > 0;
+      const summary = !hasPreciseCandidate || options.allowSemanticSummaryCandidates === true
+        ? semanticSummaryEvidence(metadata)
+        : null;
+      if (summary) {
+        const center = reliableFocusTime(metadata);
+        const duration = Math.min(14, Math.max(7, Number(metadata.duration || 0) * 0.16 || 10));
+        const start = Math.max(0, Math.min(Number(metadata.duration || duration) - duration, center - duration * 0.45));
+        const end = Math.min(Number(metadata.duration || start + duration), start + duration);
+        if (!overlapsRejectedHighlight(metadata, start, end) && end - start >= 3.5) {
+          const candidate = {
+            fileId: file.id,
+            start,
+            duration: end - start,
+            minDuration: Math.max(4, Math.min(end - start, duration * 0.75)),
+            score: clamp(summary.score - (summary.payoffVerified ? 0 : 5), 0, 100),
+            storyRole: summary.storyRole,
+            state: summary.state,
+            action: summary.action,
+            subject: summary.subject || subject,
+            tags,
+            confidence: summary.payoffVerified ? "high" : "medium",
+            impactTime: Math.min(end, Math.max(start, center)),
+            source: summary.payoffVerified ? "vision-summary" : "vision-summary-candidate"
+          };
+          if (isExcluded(candidate)) rejected.push({ fileId: file.id, reason: "Visual reviewer rejected semantic summary candidate" });
+          else candidates.push(candidate);
+        }
+      }
+
+      const localSignal = localSignalCandidateEvidence(metadata);
+      if (localSignal) {
+        const { start, end, duration } = localSignalCandidateWindow(metadata, localSignal);
+        if (!overlapsRejectedHighlight(metadata, start, end) && end - start >= 3.5) {
+          const candidate = {
+            fileId: file.id,
+            start,
+            duration: end - start,
+            minDuration: Math.max(4, Math.min(end - start, localSignal.focus - start + 2.5)),
+            score: localSignal.score,
+            storyRole: "anticipation",
+            state: "local-signal",
+            action: metadata.semanticTraits?.action || "local highlight signal",
+            subject,
+            tags,
+            confidence: localSignal.confidence,
+            impactTime: localSignal.focus,
+            source: "local-signal"
+          };
+          if (isExcluded(candidate)) rejected.push({ fileId: file.id, reason: "Visual reviewer rejected local signal interval" });
+          else candidates.push(candidate);
+        }
       }
     }
 
     for (const window of options.disableIndexedFallback ? [] : metadata.candidateWindows || []) {
-      if (options.requireVerifiedVision && Number(metadata.semanticFramesReviewed || 0) > 0) {
+      if (hasConfirmedMoments && options.requireVerifiedVision) {
+        rejected.push({ fileId: file.id, reason: "Indexed fallback skipped because user confirmed a highlight period" });
+        continue;
+      }
+      if (options.requireVerifiedVision && Number(metadata.semanticFramesReviewed || 0) > 0 && options.allowIndexedAfterUncertainVision !== true) {
         rejected.push({
           fileId: file.id,
           reason: semanticEvents.length
@@ -438,9 +631,15 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
       }
       const start = Math.max(0, Number(window.start) || 0);
       const duration = Math.min(16, Number(window.duration) || Math.max(0, Number(window.end) - start) || 8);
+      if (overlapsRejectedHighlight(metadata, start, start + duration)) {
+        rejected.push({ fileId: file.id, reason: "User rejected this indexed window as not a highlight" });
+        continue;
+      }
       const semanticPenalty = semanticEvents.length
         ? 8
-        : metadata.ratingConfidence === "low" && Number(metadata.semanticScore || 0) < 20 ? 24 : 0;
+        : metadata.ratingConfidence === "low" && Number(metadata.semanticScore || 0) < 20 ? 24
+          : options.allowIndexedAfterUncertainVision && Number(metadata.semanticFramesReviewed || 0) > 0 ? 12
+            : 0;
       const score = clamp(
         Number(window.score || metadata.indexScore || 50) * 0.68
         + Number(metadata.indexScore || 50) * 0.2
@@ -464,7 +663,7 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
         action: metadata.semanticTraits?.action || window.reason || "gameplay action",
         subject,
         tags,
-        confidence: metadata.ratingConfidence || "medium",
+        confidence: score >= 82 && metadata.ratingConfidence !== "low" ? "medium" : score >= 64 ? "medium" : "low",
         impactTime: start + duration * 0.72,
         source: "index"
       };
@@ -525,14 +724,15 @@ export function buildAgenticEditPlan(files, targetDuration = 150, options = {}) 
   const orderedSelected = orderTrailerArc(selected);
   const critique = critiqueAgenticPlan(orderedSelected, durationLimit, options);
   return {
-    segments: orderedSelected.map(({ fileId, start, duration, score, minDuration, storyRole, source }) => ({
+    segments: orderedSelected.map(({ fileId, start, duration, score, minDuration, storyRole, source, confidence }) => ({
       fileId,
       start: Math.round(start * 100) / 100,
       duration,
       minDuration: Math.round(Math.min(duration, Math.max(1, Number(minDuration) || duration)) * 100) / 100,
       score: Math.round(score),
       storyRole,
-      source
+      source,
+      confidence
     })),
     duration: Math.round(elapsed * 10) / 10,
     workflow: {
@@ -564,7 +764,7 @@ export function extendDraftToMusicDuration(draft, files, musicDuration, options 
   const allowWeakFill = options.allowWeakFill === true;
   const maxOutro = Number(options.maxLogoOutroDuration ?? maxLogoOutroDuration(musicDuration));
   const targetContentDuration = Math.max(1, Math.min(MAX_DURATION, Number(musicDuration)) - maxOutro);
-  const sources = files.filter((file) => !looksLikeGeneratedExport(file.name) && Number(file.metadata?.duration) > 0);
+  const sources = files.filter(isUsableSourceForGeneration);
   const sourceById = new Map(sources.map((file) => [file.id, file]));
   const segments = (draft.segments || [])
     .filter((segment) => sourceById.has(segment.fileId))
@@ -576,6 +776,25 @@ export function extendDraftToMusicDuration(draft, files, musicDuration, options 
   const totalDuration = () => segments.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
   let addedSegments = 0;
   let addedSeconds = 0;
+  if (options.lockReviewedCuts === true) {
+    const finalDuration = Math.round(totalDuration() * 10) / 10;
+    return {
+      ...draft,
+      segments,
+      duration: Math.max(Number(draft.duration) || 0, finalDuration),
+      workflow: {
+        ...(draft.workflow || {}),
+        musicExtension: {
+          targetContentDuration: Math.round(targetContentDuration * 10) / 10,
+          maxLogoOutroDuration: maxOutro,
+          addedSegments: 0,
+          addedSeconds: 0,
+          contentDuration: finalDuration,
+          lockedReviewedCuts: true
+        }
+      }
+    };
+  }
   const appendCandidate = (candidate, source = "music-fill") => {
     const file = sourceById.get(candidate.fileId);
     if (!file) return false;
@@ -629,20 +848,22 @@ export function extendDraftToMusicDuration(draft, files, musicDuration, options 
     }
   }
 
-  let remaining = targetContentDuration - totalDuration();
-  for (const segment of [...segments].sort((a, b) => (b.score || 0) - (a.score || 0))) {
-    if (remaining < 1) break;
-    const file = sourceById.get(segment.fileId);
-    if (!file) continue;
-    const sourceDuration = Number(file.metadata?.duration) || 0;
-    const end = (Number(segment.start) || 0) + (Number(segment.duration) || 0);
-    const extra = Math.min(remaining, allowWeakFill ? 10 : 3, Math.max(0, sourceDuration - end));
-    if (extra < 1) continue;
-    const currentMinDuration = Number(segment.minDuration) || Math.min(segment.duration, 4);
-    segment.duration = Math.round((Number(segment.duration) + extra) * 100) / 100;
-    segment.minDuration = Math.round(Math.max(currentMinDuration, Math.min(segment.duration, currentMinDuration + extra)) * 100) / 100;
-    addedSeconds += extra;
-    remaining -= extra;
+  if (options.lockExistingCuts !== true) {
+    let remaining = targetContentDuration - totalDuration();
+    for (const segment of [...segments].sort((a, b) => (b.score || 0) - (a.score || 0))) {
+      if (remaining < 1) break;
+      const file = sourceById.get(segment.fileId);
+      if (!file) continue;
+      const sourceDuration = Number(file.metadata?.duration) || 0;
+      const end = (Number(segment.start) || 0) + (Number(segment.duration) || 0);
+      const extra = Math.min(remaining, allowWeakFill ? 10 : 3, Math.max(0, sourceDuration - end));
+      if (extra < 1) continue;
+      const currentMinDuration = Number(segment.minDuration) || Math.min(segment.duration, 4);
+      segment.duration = Math.round((Number(segment.duration) + extra) * 100) / 100;
+      segment.minDuration = Math.round(Math.max(currentMinDuration, Math.min(segment.duration, currentMinDuration + extra)) * 100) / 100;
+      addedSeconds += extra;
+      remaining -= extra;
+    }
   }
 
   const finalDuration = Math.round(totalDuration() * 10) / 10;
@@ -657,7 +878,355 @@ export function extendDraftToMusicDuration(draft, files, musicDuration, options 
         maxLogoOutroDuration: maxOutro,
         addedSegments,
         addedSeconds: Math.round(addedSeconds * 10) / 10,
-        contentDuration: finalDuration
+        contentDuration: finalDuration,
+        lockExistingCuts: options.lockExistingCuts === true
+      }
+    }
+  };
+}
+
+export function applyVisualReviewEditsToDraft(draft, visualReview = {}, options = {}) {
+  const minSegmentDuration = Math.max(1, Number(options.minSegmentDuration) || 2.5);
+  const rejectedIndexes = new Set((visualReview.rejectSegmentIndexes || []).map((index) => Number(index) - 1));
+  const trimEdits = new Map();
+  for (const edit of visualReview.trimSegmentEdits || []) {
+    const index = Number(edit.segmentIndex) - 1;
+    if (!Number.isInteger(index) || index < 0) continue;
+    trimEdits.set(index, edit);
+  }
+
+  const segments = [];
+  let trimmedSegments = 0;
+  let rejectedByTrim = 0;
+  for (const [index, segment] of (draft.segments || []).entries()) {
+    if (rejectedIndexes.has(index)) continue;
+    const originalStart = Math.max(0, Number(segment.start) || 0);
+    const originalEnd = originalStart + Math.max(0, Number(segment.duration) || 0);
+    const edit = trimEdits.get(index);
+    if (!edit) {
+      segments.push({ ...segment });
+      continue;
+    }
+    const requestedStart = Number(edit.start ?? edit.keepStart ?? edit.trimStart);
+    const requestedEnd = Number(edit.end ?? edit.keepEnd ?? edit.trimEnd);
+    const nextStart = Number.isFinite(requestedStart)
+      ? Math.max(originalStart, Math.min(originalEnd, requestedStart))
+      : originalStart;
+    const nextEnd = Number.isFinite(requestedEnd)
+      ? Math.max(nextStart, Math.min(originalEnd, requestedEnd))
+      : originalEnd;
+    const nextDuration = nextEnd - nextStart;
+    if (nextDuration < minSegmentDuration) {
+      rejectedByTrim += 1;
+      continue;
+    }
+    const trimmed = Math.abs(nextStart - originalStart) > 0.05 || Math.abs(nextEnd - originalEnd) > 0.05;
+    if (trimmed) trimmedSegments += 1;
+    segments.push({
+      ...segment,
+      start: Math.round(nextStart * 100) / 100,
+      duration: Math.round(nextDuration * 100) / 100,
+      minDuration: Math.round(Math.min(nextDuration, Math.max(1, Number(segment.minDuration) || minSegmentDuration)) * 100) / 100,
+      trimReason: String(edit.reason || "Final review trimmed this shot.").slice(0, 160)
+    });
+  }
+
+  const duration = Math.round(segments.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) * 10) / 10;
+  return {
+    ...draft,
+    segments,
+    duration,
+    workflow: {
+      ...(draft.workflow || {}),
+      selectedMoments: segments.length,
+      rejectedMoments: Number(draft.workflow?.rejectedMoments || 0) + rejectedIndexes.size + rejectedByTrim,
+      visualReview: {
+        ...(draft.workflow?.visualReview || {}),
+        ...visualReview,
+        trimmedSegments,
+        rejectedByTrim
+      },
+      visualReviewEditsApplied: true
+    }
+  };
+}
+
+function intervalKey(segment) {
+  return `${segment.fileId}:${Math.round(Number(segment.start) || 0)}:${Math.round(Number(segment.duration) || 0)}`;
+}
+
+function segmentOverlaps(a, b, tolerance = 0.75) {
+  if (a.fileId !== b.fileId) return false;
+  const aStart = Number(a.start) || 0;
+  const bStart = Number(b.start) || 0;
+  return Math.max(aStart, bStart) <
+    Math.min(aStart + (Number(a.duration) || 0), bStart + (Number(b.duration) || 0)) - tolerance;
+}
+
+function sourceDurationFor(filesById, fileId) {
+  return Number(filesById.get(fileId)?.metadata?.duration) || 0;
+}
+
+function polishSegmentAroundKnownPeak(segment, file) {
+  const metadata = file?.metadata || {};
+  const sourceDuration = Number(metadata.duration) || 0;
+  const start = Math.max(0, Number(segment.start) || 0);
+  const duration = Math.max(0, Number(segment.duration) || 0);
+  const end = Math.min(sourceDuration || start + duration, start + duration);
+  if (end - start < 1) return null;
+  const candidatePeaks = [
+    Number(segment.impactTime),
+    Number(metadata.semanticTopFrame),
+    Number(metadata.highlightStart),
+    Number(metadata.localSignalTime),
+    Number(metadata.actionPeakTime)
+  ].filter((time) => Number.isFinite(time) && time >= start - 1 && time <= end + 1);
+  for (const event of metadata.semanticEvents || []) {
+    const eventStart = Number(event.start);
+    const eventEnd = Number(event.end);
+    const impact = Number(event.impactTime);
+    if (Number.isFinite(impact) && impact >= start - 1 && impact <= end + 1) candidatePeaks.push(impact);
+    else if (Number.isFinite(eventStart) && Number.isFinite(eventEnd) &&
+      Math.max(start, eventStart) < Math.min(end, eventEnd) - 0.5) {
+      candidatePeaks.push(Math.min(eventEnd, Math.max(eventStart, eventStart + (eventEnd - eventStart) * 0.72)));
+    }
+  }
+  if (!candidatePeaks.length) return { ...segment, start: Math.round(start * 100) / 100, duration: Math.round((end - start) * 100) / 100 };
+  const peak = candidatePeaks.sort((a, b) => {
+    const center = start + (end - start) * 0.62;
+    return Math.abs(a - center) - Math.abs(b - center);
+  })[0];
+  const role = segment.storyRole || segment.state || "";
+  const highImpact = ["payoff", "impact", "reaction"].includes(role);
+  const before = highImpact ? 2.5 : 1.6;
+  const after = highImpact ? 4.2 : 3;
+  const minDuration = Math.max(2.5, Math.min(Number(segment.minDuration) || 3.5, highImpact ? 5.5 : 4));
+  let nextStart = Math.max(start, peak - before);
+  let nextEnd = Math.min(end, peak + after);
+  if (nextEnd - nextStart < minDuration) {
+    const missing = minDuration - (nextEnd - nextStart);
+    nextStart = Math.max(start, nextStart - missing * 0.45);
+    nextEnd = Math.min(end, nextEnd + missing * 0.55);
+  }
+  if (nextEnd - nextStart < 2.5) return { ...segment, start: Math.round(start * 100) / 100, duration: Math.round((end - start) * 100) / 100 };
+  const changed = Math.abs(nextStart - start) > 0.15 || Math.abs(nextEnd - end) > 0.15;
+  return {
+    ...segment,
+    start: Math.round(nextStart * 100) / 100,
+    duration: Math.round((nextEnd - nextStart) * 100) / 100,
+    minDuration: Math.round(Math.min(nextEnd - nextStart, Math.max(1, Number(segment.minDuration) || minDuration)) * 100) / 100,
+    ...(changed ? { trimReason: segment.trimReason || "Final editor centered this cut around the strongest detected moment." } : {})
+  };
+}
+
+export function polishFinalTimeline(draft, files, targetDuration = 90, options = {}) {
+  const sources = files.filter(isUsableSourceForGeneration);
+  const filesById = new Map(sources.map((file) => [file.id, file]));
+  const target = Math.min(MAX_DURATION, Math.max(12, Number(targetDuration) || Number(draft.duration) || 90));
+  const minimumUsefulDuration = Math.min(target, Math.max(8, target * 0.55));
+  const minimumUsefulSegments = Math.min(6, Math.max(2, Math.ceil(target / 24)));
+  const segments = [];
+  let trimmedSegments = 0;
+  let removedSegments = 0;
+
+  for (const segment of draft.segments || []) {
+    const file = filesById.get(segment.fileId);
+    const sourceDuration = sourceDurationFor(filesById, segment.fileId);
+    if (!file || !sourceDuration) {
+      removedSegments += 1;
+      continue;
+    }
+    const start = Math.max(0, Math.min(sourceDuration, Number(segment.start) || 0));
+    const duration = Math.min(Math.max(0, Number(segment.duration) || 0), Math.max(0, sourceDuration - start));
+    if (duration < 2.5) {
+      removedSegments += 1;
+      continue;
+    }
+    const polished = polishSegmentAroundKnownPeak({ ...segment, start, duration }, file);
+    if (!polished || Number(polished.duration || 0) < 2.5) {
+      removedSegments += 1;
+      continue;
+    }
+    if (segments.some((item) => segmentOverlaps(item, polished))) {
+      removedSegments += 1;
+      continue;
+    }
+    if (Math.abs(Number(polished.start) - start) > 0.05 || Math.abs(Number(polished.duration) - duration) > 0.05) trimmedSegments += 1;
+    segments.push(polished);
+  }
+
+  let currentDuration = segments.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+  const excludedIntervals = new Set([
+    ...segments.map(intervalKey),
+    ...(Array.isArray(options.excludedIntervals) ? options.excludedIntervals : [])
+  ]);
+  const replacementPlan = buildAgenticEditPlan(sources, target, {
+    minScore: Number(options.minScore) || 64,
+    relaxedMinScore: Number(options.relaxedMinScore) || 58,
+    reviewCandidateMinScore: Number(options.reviewCandidateMinScore) || 64,
+    requireVerifiedVision: false,
+    allowReviewCandidates: true,
+    allowWeakReviewCandidates: false,
+    allowIndexedAfterUncertainVision: true,
+    allowSemanticSummaryCandidates: true,
+    gameGenre: options.gameGenre,
+    qualityFirst: true,
+    excludedIntervals: [...excludedIntervals]
+  });
+  let replacementSegments = 0;
+  for (const candidate of replacementPlan.segments || []) {
+    if (currentDuration >= minimumUsefulDuration && segments.length >= minimumUsefulSegments) break;
+    const file = filesById.get(candidate.fileId);
+    if (!file) continue;
+    const polished = polishSegmentAroundKnownPeak({ ...candidate, source: candidate.source || "final-polish-fill" }, file);
+    if (!polished || Number(polished.duration || 0) < 2.5) continue;
+    if (segments.some((segment) => segmentOverlaps(segment, polished))) continue;
+    const remaining = target - currentDuration;
+    if (remaining < 2.5) break;
+    const duration = Math.min(Number(polished.duration) || 0, remaining);
+    segments.push({
+      ...polished,
+      duration: Math.round(duration * 100) / 100,
+      minDuration: Math.round(Math.min(duration, Math.max(1, Number(polished.minDuration) || duration)) * 100) / 100,
+      source: polished.source || "final-polish-fill"
+    });
+    replacementSegments += 1;
+    currentDuration += duration;
+  }
+
+  const ordered = orderTrailerArc(segments).slice(0, 40);
+  const duration = Math.round(ordered.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) * 10) / 10;
+  const critique = critiqueAgenticPlan(ordered, target, { qualityFirst: true });
+  return {
+    ...draft,
+    segments: ordered,
+    duration,
+    workflow: {
+      ...(draft.workflow || {}),
+      selectedMoments: ordered.length,
+      rejectedMoments: Number(draft.workflow?.rejectedMoments || 0) + removedSegments,
+      status: ordered.length ? "final-polished" : "needs-stronger-sources",
+      critique,
+      finalPolish: {
+        enabled: true,
+        targetDuration: Math.round(target * 10) / 10,
+        trimmedSegments,
+        removedSegments,
+        replacementSegments,
+        replacementCandidates: replacementPlan.segments?.length || 0,
+        contentDuration: duration,
+        mode: "auto-polish"
+      }
+    }
+  };
+}
+
+export function fitTimelineToDuration(draft, targetDuration = 0, options = {}) {
+  const target = Math.min(MAX_DURATION, Math.max(1, Number(targetDuration) || Number(draft.duration) || MAX_DURATION));
+  const minSegmentDuration = Math.max(1, Number(options.minSegmentDuration) || 2.5);
+  const maxSourceUses = Math.max(1, Math.round(Number(options.maxSourceUses) || 1));
+  const valueFor = (segment) => {
+    const role = segment.storyRole || segment.state;
+    const roleBonus = ["payoff", "impact", "reaction"].includes(role) ? 14 : role === "anticipation" ? 6 : 0;
+    return (Number(segment.score) || 0) + roleBonus + (segment.confidence === "high" ? 8 : segment.confidence === "low" ? -5 : 0);
+  };
+  const eligibleSegments = (draft.segments || [])
+    .map((segment, index) => ({
+      ...segment,
+      originalIndex: index,
+      start: Math.max(0, Number(segment.start) || 0),
+      duration: Math.max(0, Number(segment.duration) || 0),
+      score: Math.round(Number(segment.score) || 60)
+    }))
+    .filter((segment) => segment.duration >= minSegmentDuration);
+  const bySource = new Map();
+  for (const segment of eligibleSegments) {
+    const key = String(segment.fileId || "");
+    const bucket = bySource.get(key) || [];
+    bucket.push(segment);
+    bucket.sort((a, b) => valueFor(b) - valueFor(a));
+    bySource.set(key, bucket.slice(0, maxSourceUses));
+  }
+  const originalSegments = [...bySource.values()].flat().sort((a, b) => a.originalIndex - b.originalIndex);
+  const originalDuration = originalSegments.reduce((sum, segment) => sum + segment.duration, 0);
+  if (!originalSegments.length || originalDuration <= target + 0.05) {
+    const segments = originalSegments.map(({ originalIndex: _, ...segment }) => segment);
+    return {
+      ...draft,
+      segments,
+      duration: Math.round(Math.min(originalDuration, target) * 10) / 10,
+      workflow: {
+        ...(draft.workflow || {}),
+        timelineFit: {
+          targetDuration: Math.round(target * 10) / 10,
+          originalDuration: Math.round(originalDuration * 10) / 10,
+          removedSegments: Math.max(0, eligibleSegments.length - originalSegments.length),
+          trimmedSegments: 0,
+          duplicateSourcesRemoved: Math.max(0, eligibleSegments.length - originalSegments.length),
+          mode: options.mode || "duration-fit"
+        }
+      }
+    };
+  }
+
+  const ranked = [...originalSegments].sort((a, b) => {
+    return valueFor(b) - valueFor(a);
+  });
+  const selected = [];
+  const fileUses = new Map();
+  let total = 0;
+  let trimmedSegments = 0;
+  for (const candidate of ranked) {
+    const remaining = target - total;
+    if (remaining < minSegmentDuration) break;
+    if ((fileUses.get(candidate.fileId) || 0) >= maxSourceUses) continue;
+    let duration = candidate.duration;
+    if (duration > remaining) {
+      if (remaining < Math.max(minSegmentDuration, Number(candidate.minDuration) || minSegmentDuration)) continue;
+      duration = remaining;
+      trimmedSegments += 1;
+    }
+    selected.push({
+      ...candidate,
+      duration: Math.round(duration * 100) / 100,
+      minDuration: Math.round(Math.min(duration, Math.max(1, Number(candidate.minDuration) || minSegmentDuration)) * 100) / 100
+    });
+    fileUses.set(candidate.fileId, (fileUses.get(candidate.fileId) || 0) + 1);
+    total += duration;
+  }
+
+  if (!selected.length) {
+    const first = originalSegments[0];
+    const duration = Math.min(first.duration, target);
+    selected.push({
+      ...first,
+      duration: Math.round(duration * 100) / 100,
+      minDuration: Math.round(Math.min(duration, Math.max(1, Number(first.minDuration) || minSegmentDuration)) * 100) / 100
+    });
+    trimmedSegments += first.duration > duration ? 1 : 0;
+    total = duration;
+  }
+
+  const ordered = options.preserveOrder === true
+    ? selected.sort((a, b) => a.originalIndex - b.originalIndex)
+    : orderTrailerArc(selected);
+  const segments = ordered.map(({ originalIndex: _, ...segment }) => segment);
+  const duration = Math.round(segments.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) * 10) / 10;
+  return {
+    ...draft,
+    segments,
+    duration,
+    workflow: {
+      ...(draft.workflow || {}),
+      selectedMoments: segments.length,
+      status: draft.workflow?.status || "duration-fit",
+      timelineFit: {
+        targetDuration: Math.round(target * 10) / 10,
+        originalDuration: Math.round(originalDuration * 10) / 10,
+        removedSegments: Math.max(0, eligibleSegments.length - segments.length),
+        trimmedSegments,
+        duplicateSourcesRemoved: Math.max(0, eligibleSegments.length - originalSegments.length),
+        mode: options.mode || "duration-fit"
       }
     }
   };
@@ -747,17 +1316,22 @@ function critiqueAgenticPlan(segments, targetDuration, options = {}) {
 
 export function recommendTrailerDuration(files, requestedDuration = 0) {
   if (Number(requestedDuration) > 0) return Math.min(MAX_DURATION, Math.max(45, Number(requestedDuration)));
-  const sourceFiles = files.filter((file) => !looksLikeGeneratedExport(file.name));
+  const sourceFiles = files.filter(isUsableSourceForGeneration);
   const verifiedSeconds = sourceFiles.reduce((sum, file) => {
+    const confirmedSeconds = (file.metadata.confirmedHighlightMoments || []).slice(0, 3)
+      .filter((moment) => !overlapsRejectedHighlight(file.metadata || {}, Number(moment.start) || 0, intervalEnd(moment)))
+      .reduce((momentSum, moment) => momentSum + Math.min(18, Math.max(4, Number(moment.duration) || (Number(moment.end) - Number(moment.start)) || 0)), 0);
     const events = [...(file.metadata.semanticEvents || [])]
+      .filter((event) => !overlapsRejectedHighlight(file.metadata || {}, Number(event.start) || 0, intervalEnd(event)))
       .filter((event) => !["menu", "scoreboard", "map", "loading", "death", "waiting"].includes(event.state))
       .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
       .slice(0, 2);
-    return sum + events.reduce((eventSum, event) =>
+    return sum + confirmedSeconds + events.reduce((eventSum, event) =>
       eventSum + Math.min(10, Math.max(5, Number(event.end || 0) - Number(event.start || 0) + 2)), 0);
   }, 0);
   const fallbackSeconds = sourceFiles.reduce((sum, file) =>
     sum + (file.metadata.candidateWindows || []).filter((window) => Number(window.score) >= 85).slice(0, 1)
+      .filter((window) => !overlapsRejectedHighlight(file.metadata || {}, Number(window.start) || 0, intervalEnd(window)))
       .reduce((windowSum, window) => windowSum + Math.min(12, Number(window.duration) || 8), 0), 0);
   const target = verifiedSeconds || fallbackSeconds || sourceFiles.length * 7;
   return Math.min(180, MAX_DURATION, Math.max(45, Math.round(target / 5) * 5));
@@ -767,15 +1341,27 @@ function looksLikeGeneratedExport(name = "") {
   return /(?:vision reviewed|created with highlightai|highlightai export|trailer - vision|assets\.json|^warsaw\b.*trailer)/i.test(name);
 }
 
+function isUsableSourceForGeneration(file) {
+  const metadata = file?.metadata || {};
+  return Boolean(file) &&
+    !looksLikeGeneratedExport(file.name) &&
+    Number(metadata.duration || 0) > 0 &&
+    metadata.videoCodec !== "pending" &&
+    metadata.aiDecision !== "rejected";
+}
+
 function createSemanticTrailerSegments(files, limit, contentLimit) {
   const events = [];
   for (const file of files) {
     for (const event of file.metadata.semanticEvents || []) {
       const traits = file.metadata.semanticTraits || {};
+      const start = Math.max(0, Number(event.start) || 0);
+      const end = Math.min(file.metadata.duration || 0, Number(event.end) || Number(event.start) + 3);
+      if (overlapsRejectedHighlight(file.metadata || {}, start, end)) continue;
       events.push({
         file,
-        start: Math.max(0, Number(event.start) || 0),
-        end: Math.min(file.metadata.duration || 0, Number(event.end) || Number(event.start) + 3),
+        start,
+        end,
         score: Number(event.score) || file.metadata.semanticScore || 60,
         state: event.state || "other",
         cutRisk: event.cutRisk || "medium",
@@ -823,10 +1409,13 @@ function createIndexedTrailerSegments(files, contentLimit, initialTotal = 0) {
   const windows = [];
   for (const file of files) {
     for (const window of file.metadata.candidateWindows || []) {
+      const start = Math.max(0, Number(window.start) || 0);
+      const duration = Math.max(4, Number(window.duration) || ((Number(window.end) || 0) - (Number(window.start) || 0)) || 8);
+      if (overlapsRejectedHighlight(file.metadata || {}, start, start + duration)) continue;
       windows.push({
         file,
-        start: Math.max(0, Number(window.start) || 0),
-        duration: Math.max(4, Number(window.duration) || ((Number(window.end) || 0) - (Number(window.start) || 0)) || 8),
+        start,
+        duration,
         score: Number(window.score) || 50,
         storyRole: window.storyRole || "setup",
         cutRisk: window.cutRisk || "medium"
@@ -900,7 +1489,8 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
   if (musicDuration > MAX_DURATION + 0.1) {
     throw new Error(`Soundtrack exceeds the ${MAX_DURATION}-second video limit and cannot be preserved without trimming.`);
   }
-  const availableMusic = Math.max(1, musicDuration);
+  const repeats = Math.max(1, Math.min(2, Math.round(Number(draft.musicRepeats) || 1)));
+  const availableMusic = Math.max(1, Math.min(MAX_DURATION, musicDuration * repeats));
   const { stderr } = await run("ffmpeg", [
     "-hide_banner", "-i", musicPath,
     "-af", "asetnsamples=n=22050,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
@@ -913,7 +1503,14 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
     index > 0 && index < frames.length - 1 &&
     frame.level >= frames[index - 1].level && frame.level >= frames[index + 1].level
   );
-  const peaks = firstPassPeaks.filter((peak) => peak.time <= availableMusic);
+  const sourcePeaks = firstPassPeaks.filter((peak) => peak.time <= musicDuration);
+  const peaks = [];
+  for (let repeat = 0; repeat < repeats; repeat += 1) {
+    for (const peak of sourcePeaks) {
+      const time = peak.time + repeat * musicDuration;
+      if (time <= availableMusic) peaks.push({ ...peak, time });
+    }
+  }
   const chooseBeat = (elapsed, naturalEnd, minDuration, maxDuration) => {
     const earliest = elapsed + minDuration;
     const latest = elapsed + maxDuration;
@@ -954,13 +1551,13 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
     contentDuration,
     outroDuration,
     musicDuration: Math.round(musicDuration * 10) / 10,
-    musicRepeats: 1,
+    musicRepeats: repeats,
     musicPlan: {
       sourceDuration: Math.round(musicDuration * 10) / 10,
       contentDuration,
       timelineDuration,
       outroDuration,
-      repeats: 1,
+      repeats,
       ending: outroDuration > 0.2 ? "full-track ending with game logo" : "full-track ending",
       syncPoints: peaks.length
     }
@@ -1016,13 +1613,21 @@ export async function renderHighlight({ project, draft, outputPath, workRoot, mu
       const trailer = draft.style === "Trailer";
       const musicVolume = trailer ? 1 : 0.16;
       const gameVolume = trailer ? 0.12 : 1;
+      const repeats = Math.max(1, Math.min(2, Math.round(Number(draft.musicRepeats) || 1)));
+      const visualDuration = Number((await probe(visualPath, signal)).duration) || Number(draft.duration) || MAX_DURATION;
+      const sourceMusicDuration = Number(draft.musicDuration) || Number((await probe(musicPath, signal)).duration) || visualDuration;
+      const availableMusicDuration = Math.max(0.1, Math.min(MAX_DURATION, sourceMusicDuration * repeats));
+      const mixDuration = Math.round(Math.min(MAX_DURATION, visualDuration, Number(draft.duration) || visualDuration, availableMusicDuration) * 100) / 100;
+      draft.duration = mixDuration;
+      const fadeDuration = Math.round(Math.min(1.8, Math.max(0.25, mixDuration * 0.12)) * 100) / 100;
+      const fadeStart = Math.round(Math.max(0, mixDuration - fadeDuration) * 100) / 100;
       const baseArgs = [
-        "-y", "-i", visualPath, "-i", musicPath,
+        "-y", "-i", visualPath, ...(repeats > 1 ? ["-stream_loop", String(repeats - 1)] : []), "-i", musicPath,
         "-filter_complex", trailer
-          ? `[1:a]atrim=duration=${draft.duration},volume=${musicVolume},loudnorm=I=-11:TP=-1:LRA=7[music];[0:a]volume=${gameVolume},highpass=f=90,acompressor=threshold=-24dB:ratio=6:attack=8:release=150[game];[music][game]amix=inputs=2:duration=first:dropout_transition=1:weights='1 0.08':normalize=0,alimiter=limit=0.95,volume=-1.2dB[a]`
-          : `[0:a]volume=${gameVolume}[a0];[1:a]atrim=duration=${draft.duration},volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first[a]`,
+          ? `[1:a]atrim=duration=${mixDuration},loudnorm=I=-11:TP=-1:LRA=7,afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[music];[0:a]volume=${gameVolume},highpass=f=90,acompressor=threshold=-24dB:ratio=6:attack=8:release=150[game];[music][game]amix=inputs=2:duration=first:dropout_transition=1:weights='1 0.08':normalize=0,alimiter=limit=0.95,volume=-1.2dB[a]`
+          : `[0:a]volume=${gameVolume}[a0];[1:a]atrim=duration=${mixDuration},afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first[a]`,
         "-map", "0:v", "-map", "[a]", "-c:a", "aac", "-b:a", trailer ? "224k" : "192k",
-        "-t", String(Math.min(MAX_DURATION, draft.duration))
+        "-t", String(mixDuration)
       ];
       await onProgress?.({ completed, total: draft.segments.length, phase: "compressing" });
       draft.encoding = await encodeFinalVideo(baseArgs, outputPath, signal);

@@ -180,12 +180,13 @@ h1 em { color: var(--lime); font-style: normal; }
 .mix-card { margin-top: 18px; border: 1px solid var(--line); background: #0d1115; border-radius: 11px; padding: 12px; }.mix-card > div:first-child { display: grid; grid-template-columns: 20px 1fr; gap: 2px 7px; }.mix-card svg { grid-row: 1/3; color: var(--lime); }.mix-card span { color: #858e86; font-size: 9px; }.mix-card strong { font-size: 10px; }.mix-bar { height: 3px; margin: 12px 0 8px; background: #252b26; }.mix-bar span { display:block; height:100%; background:var(--lime); }.mix-card small { color: #656d66; font-size: 8px; }
 .review-card { margin-top: 18px; border: 1px solid rgba(185,255,102,.22); background: linear-gradient(135deg,rgba(185,255,102,.06),#0d1115); border-radius: 11px; padding: 12px; }.review-card > div:first-child { display: grid; grid-template-columns: 20px 1fr auto; gap: 7px; align-items: center; }.review-card svg { color: var(--lime); }.review-card span { color: #858e86; font-size: 9px; }.review-card strong { color: #e5f2e6; font-size: 11px; }.review-card small { display:block; margin-top:9px; color:#7d867f; font-size:9px; line-height:1.45; }
 .chat-input { margin-top: 18px; display: flex; gap: 5px; align-items: center; border: 1px solid var(--line); padding: 5px 5px 5px 10px; border-radius: 10px; background: #0d1115; }.chat-input input { font-size: 9px; }.chat-input button { width: 31px; height: 31px; border-radius: 7px; }
-.toast { position: fixed; z-index: 20; bottom: 22px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: #151b17; border: 1px solid rgba(185,255,102,.3); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.4); color: #c9d1ca; font-size: 11px; }.toast svg { color:var(--lime); }.toast button { border:0;background:none;color:#8b938c;padding:0;display:grid; }
+.toast { position: fixed; z-index: 20; bottom: 22px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; max-width: min(540px, calc(100vw - 32px)); padding: 10px 12px; background: #151b17; border: 1px solid rgba(185,255,102,.3); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.4); color: #c9d1ca; font-size: 11px; animation: toast-dismiss 3.3s ease forwards; }.toast span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.toast svg { flex: 0 0 auto; color:var(--lime); }.toast button { flex: 0 0 auto; border:0;background:none;color:#8b938c;padding:0;display:grid; }
 .busy-overlay { position: fixed; z-index: 50; inset: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; background: rgba(5,7,9,.82); backdrop-filter: blur(10px); }
 .busy-overlay svg { color: var(--lime); animation: spin .9s linear infinite; }
 .busy-overlay strong { font-family: "Space Grotesk"; font-size: 18px; }
 .busy-overlay span { color: var(--muted); font-size: 11px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes toast-dismiss { 0%,72% { opacity: 1; transform: translate(-50%,0); } 100% { opacity: 0; transform: translate(-50%,8px); } }
 .lucide-pause,
 .lucide-play { animation: none !important; }
 .modal-backdrop { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(4,6,8,.8); backdrop-filter: blur(9px); }
@@ -208,6 +209,14 @@ h1 em { color: var(--lime); font-style: normal; }
 .asset-divider::before, .asset-divider::after { content:""; height:1px; flex:1; background:var(--line); }
 .asset-disclaimer { color:#747c75;font-size:9px;line-height:1.5;margin:12px 0 16px; }.public-results { display:grid;gap:7px; }.public-results article { display:grid;grid-template-columns:24px 1fr 26px 65px;gap:8px;align-items:center;padding:11px;border:1px solid var(--line);border-radius:10px;background:#101519; }.public-results article > svg { color:var(--lime); }.public-results strong,.public-results span,.public-results small { display:block; }.public-results strong{font-size:10px}.public-results span{color:#919991;font-size:9px;margin-top:2px}.public-results small{color:#626a63;font-size:8px;margin-top:3px}.public-results a{color:#8e978f;display:grid;place-items:center}
 .settings-modal { width:min(620px,100%);max-width:620px; }
+.review-generate-modal { width:min(520px,100%); }
+.review-generate-summary { display:flex; gap:14px; align-items:flex-start; margin:18px 0; padding:16px; border:1px solid var(--line); border-radius:12px; background:rgba(185,255,102,.08); }
+.review-generate-summary svg { flex:0 0 auto; color:var(--lime); }
+.review-generate-summary strong { display:block; margin-bottom:5px; color:var(--text); font-size:16px; }
+.review-generate-summary p { margin:0; color:var(--muted); font-size:12px; line-height:1.55; }
+.review-generate-actions { display:grid; grid-template-columns:1fr 1.2fr; gap:10px; }
+.review-generate-actions button { min-height:44px; border:1px solid var(--line); border-radius:10px; background:#11161a; color:var(--text); font-weight:800; }
+.review-generate-actions .confirm-highlight-button { display:flex; align-items:center; justify-content:center; gap:8px; border-color:var(--accent-fill); background:var(--accent-fill); color:#080b08; }
 .settings-intro { margin:10px 0 18px;color:#9aa39b;font-size:12px;line-height:1.55; }
 .settings-group { margin-top:18px; }
 .settings-group-title { display:grid;grid-template-columns:18px 1fr auto;gap:8px;align-items:center;margin:0 2px 8px;color:#8c958d;text-transform:uppercase;letter-spacing:.1em;font-size:9px;font-weight:800; }
@@ -326,6 +335,8 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .asset-modal header button:hover,
 :root[data-theme="light"] .media-viewer header button:hover,
 :root[data-theme="light"] .generated-video-modal header button:hover { border-color:#91a18f;background:#e3e9e2;color:#111a13; }
+:root[data-theme="light"] .review-generate-summary { background:rgba(98,202,37,.1); border-color:#c5dec0; }
+:root[data-theme="light"] .review-generate-actions button { background:#f5f7f4; color:#172019; border-color:#cfd8cc; }
 :root[data-theme="light"] .selected-count { color:#566159; }
 :root[data-theme="light"] .clip-toolbar .vision-cancel-button { border-color:#e0aaa7;background:#fff2f1;color:#8b2825; }
 :root[data-theme="light"] .simple-progress-bar { background:#dce5d8; }
@@ -353,6 +364,27 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .activity-indicator { background:rgba(255,255,255,.96); }
 :root[data-theme="light"] .generation-progress strong,
 :root[data-theme="light"] .local-music-button strong { color:#172019; }
+:root[data-theme="light"] .highlight-review-page { background:#edf1eb; }
+:root[data-theme="light"] .review-page-heading h2 { color:#172019; }
+:root[data-theme="light"] .review-page-heading p,
+:root[data-theme="light"] .highlight-trim-box small,
+:root[data-theme="light"] .picked-highlight-list article small { color:#5d695f; }
+:root[data-theme="light"] .highlight-trim-box,
+:root[data-theme="light"] .picked-highlight-panel,
+:root[data-theme="light"] .picked-highlight-list article,
+:root[data-theme="light"] .picked-highlight-list article button,
+:root[data-theme="light"] .picked-highlight-actions button { border-color:#d6dfd4;background:#fff;color:#172019; }
+:root[data-theme="light"] .highlight-review-empty { border-color:#d6dfd4;background:#fff;color:#5d695f; }
+:root[data-theme="light"] .highlight-review-empty strong,
+:root[data-theme="light"] .picked-highlight-panel > div:first-child strong,
+:root[data-theme="light"] .picked-highlight-list article strong { color:#172019; }
+:root[data-theme="light"] .trim-track { background:#dce5d8; }
+:root[data-theme="light"] .picked-highlight-thumbnail { background:#111 !important; }
+:root[data-theme="light"] .picked-highlight-actions .confirm-highlight-button,
+:root[data-theme="light"] .highlight-review-controls .confirm-highlight-button { background:var(--accent-fill);color:#102008; }
+:root[data-theme="light"] .highlight-review-controls button { border-color:#c5cec4;background:#f8faf7;color:#273229; }
+:root[data-theme="light"] .highlight-review-controls .reject-highlight-button { border-color:#e0aaa7;background:#fff2f1;color:#8b2825; }
+:root[data-theme="light"] .toast { background:rgba(255,255,255,.96); color:#172019; border-color:rgba(57,115,0,.22); box-shadow:0 12px 35px rgba(38,52,34,.16); }
 
 @media (max-width: 1000px) {
   .draft-screen { grid-template-columns: 210px 1fr; }.refine-panel { grid-column: 1/3; border-left:0; border-top:1px solid var(--line); display:grid; grid-template-columns: repeat(3,1fr); gap:16px; }.chat-input { align-self:end; }

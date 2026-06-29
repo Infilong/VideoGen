@@ -12,6 +12,40 @@ export function localMediaUrl(relativePath: string) {
   return `${LOCAL_ORIGIN}${relativePath.startsWith("/") ? relativePath : `/${relativePath}`}`;
 }
 
+const fallbackIssue: OperationIssue = {
+  title: "Processing stopped",
+  message: "HighlightAI could not finish that step.",
+  action: "Please try again. If it keeps happening, reduce the selection size or restart the app.",
+  recoverable: true
+};
+
+function hasBackendDetails(value = "") {
+  return /(?:ffmpeg|ffprobe|libx264|libx265|encoder|decoder|stderr|stdout|exited\s+-?\d+|error code|invalid argument|conversion failed|malloc|0x[0-9a-f]+|\[[a-z0-9#:@/.-]+]|(?:[A-Z]:\\|\/(?:Users|tmp|var|home|mnt|usr|app)\/)|node_modules|stack trace|traceback|errno|syscall|EADDRINUSE|ECONN|ENOTFOUND|EAI_AGAIN|https?:\/\/|api[_ -]?key|authorization|bearer|token|secret|password|sk-[a-z0-9_-]+|\b(?:TypeError|ReferenceError|SyntaxError)\b)/i.test(value);
+}
+
+function isUnsafeUserMessage(value: unknown) {
+  const text = String(value || "");
+  return !text.trim() || text.length > 240 || /[\r\n]/.test(text) || hasBackendDetails(text);
+}
+
+function sanitizeIssue(issue: Partial<OperationIssue> = {}, fallback: Partial<OperationIssue> = {}): OperationIssue {
+  const title = isUnsafeUserMessage(issue.title)
+    ? fallback.title || fallbackIssue.title
+    : String(issue.title || fallback.title || fallbackIssue.title);
+  const message = isUnsafeUserMessage(issue.message)
+    ? fallback.message || fallbackIssue.message
+    : String(issue.message || fallback.message || fallbackIssue.message);
+  const action = isUnsafeUserMessage(issue.action)
+    ? fallback.action || fallbackIssue.action
+    : String(issue.action || fallback.action || fallbackIssue.action);
+  return {
+    title,
+    message,
+    action,
+    recoverable: issue.recoverable !== false
+  };
+}
+
 async function responseJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   let body: any = {};
@@ -24,14 +58,13 @@ async function responseJson<T>(response: Response): Promise<T> {
   }
   if (!response.ok) {
     const payload = typeof body.error === "object" ? body.error : { message: body.error };
-    const error = new Error(payload.message || "Local service request failed.") as Error & { issue?: OperationIssue };
-    error.issue = {
-      title: payload.title || "Could not complete that step",
-      message: payload.message || "Local service request failed.",
-      action: payload.action,
-      details: payload.details,
-      recoverable: payload.recoverable !== false
-    };
+    const issue = sanitizeIssue(payload, {
+      title: "Could not complete that step",
+      message: "HighlightAI could not finish that step.",
+      action: "Please try again. If it keeps happening, restart the app and run it again."
+    });
+    const error = new Error(issue.message) as Error & { issue?: OperationIssue };
+    error.issue = issue;
     throw error;
   }
   return body as T;
@@ -39,14 +72,14 @@ async function responseJson<T>(response: Response): Promise<T> {
 
 export function issueFromError(error: unknown): OperationIssue {
   if (error instanceof Error && "issue" in error && (error as Error & { issue?: OperationIssue }).issue) {
-    return (error as Error & { issue: OperationIssue }).issue;
+    return sanitizeIssue((error as Error & { issue: OperationIssue }).issue);
   }
-  return {
+  return sanitizeIssue({
     title: "Processing stopped",
     message: error instanceof Error ? error.message : "An unexpected local error occurred.",
-    action: "Retry the operation. Files already copied into HighlightAI are preserved.",
+    action: "Please try again. Files already copied into HighlightAI are preserved.",
     recoverable: true
-  };
+  });
 }
 
 export async function getDiagnostics(): Promise<Diagnostics> {
@@ -251,11 +284,16 @@ export async function addAssets(projectId: string, files: File[]): Promise<Proje
   return responseJson(await fetch(`${API}/projects/${projectId}/assets`, { method: "POST", body: form }));
 }
 
-export async function generateDraft(projectId: string, idea: VideoIdea, intensity = 78): Promise<Draft> {
+export async function generateDraft(
+  projectId: string,
+  idea: VideoIdea,
+  intensity = 78,
+  excludedIntervals: Array<{ fileId: string; start: number; duration: number }> = []
+): Promise<Draft> {
   return responseJson(await fetch(`${API}/projects/${projectId}/drafts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idea: { ...idea, intensity } })
+    body: JSON.stringify({ idea: { ...idea, intensity, excludedIntervals } })
   }));
 }
 
@@ -283,23 +321,74 @@ export async function resumeRenderJob(jobId: string): Promise<RenderJob> {
   return responseJson(await fetch(`${API}/render-jobs/${jobId}/resume`, { method: "POST" }));
 }
 
+export async function confirmHighlightMoment(
+  projectId: string,
+  fileId: string,
+  moment: { start: number; end: number; score?: number; state?: string; action?: string; storyRole?: string; source?: string; replaceStart?: number; replaceEnd?: number }
+): Promise<Project> {
+  return responseJson(await fetch(`${API}/projects/${projectId}/files/${fileId}/highlight-confirmations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(moment)
+  }));
+}
+
+export async function rejectHighlightMoment(
+  projectId: string,
+  fileId: string,
+  moment: { start: number; end: number; source?: string; reason: "not-highlight" }
+): Promise<Project> {
+  return responseJson(await fetch(`${API}/projects/${projectId}/files/${fileId}/highlight-rejections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(moment)
+  }));
+}
+
+export async function markHighlightReviewed(projectId: string, fileId: string, reviewed = true): Promise<Project> {
+  return responseJson(await fetch(`${API}/projects/${projectId}/files/${fileId}/highlight-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reviewed })
+  }));
+}
+
+export async function removeHighlightConfirmation(
+  projectId: string,
+  fileId: string,
+  moment: { start: number; end: number }
+): Promise<Project> {
+  return responseJson(await fetch(`${API}/projects/${projectId}/files/${fileId}/highlight-confirmations`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(moment)
+  }));
+}
+
 export async function renderDraft(
   projectId: string,
   draftId: string,
   assetId?: string,
   reviewProvider?: { endpoint: string; apiKey: string; model: string },
-  onProgress?: (job: RenderJob) => void
-): Promise<{ url: string; localPath?: string; draft: Draft; assetManifest?: Record<string, unknown> }> {
+  onProgress?: (job: RenderJob) => void,
+  musicRepeats = 1
+): Promise<
+  | { url: string; localPath?: string; draft: Draft; assetManifest?: Record<string, unknown> }
+  | { needsReview: true; job: RenderJob; draft?: Draft }
+> {
   let job = await responseJson<RenderJob>(await fetch(`${API}/projects/${projectId}/drafts/${draftId}/render`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ assetId, reviewProvider })
+    body: JSON.stringify({ assetId, reviewProvider, musicRepeats })
   }));
   onProgress?.(job);
-  while (!["completed", "failed", "cancelled"].includes(job.status)) {
+  while (!["completed", "needs_review", "failed", "cancelled"].includes(job.status)) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     job = await getRenderJob(job.id);
     onProgress?.(job);
+  }
+  if (job.status === "needs_review") {
+    return { needsReview: true, job, draft: job.result?.draft };
   }
   if (job.status === "cancelled") {
     const error = new Error("Rendering was cancelled.") as Error & { issue?: OperationIssue };
@@ -346,7 +435,7 @@ export async function requestVisionReview(projectId: string, config: { endpoint:
 
 export async function estimatePreprocess(
   projectId: string,
-  options: { sampleInterval?: number; concurrency?: number; maxFiles?: number; maxFrames?: number; fileIds?: string[]; endpoint?: string; model?: string; modelSecondsPerRequest?: number; refineReviewed?: boolean } = {}
+  options: { sampleInterval?: number; concurrency?: number; maxFiles?: number; maxFrames?: number; maxRuntimeSeconds?: number; fileIds?: string[]; endpoint?: string; model?: string; modelSecondsPerRequest?: number; refineReviewed?: boolean } = {}
 ): Promise<PreprocessEstimate> {
   return responseJson(await fetch(`${API}/projects/${projectId}/preprocess/estimate`, {
     method: "POST",
@@ -424,7 +513,7 @@ export async function resumePreprocessJob(jobId: string): Promise<PreprocessJob>
 export async function runPreprocess(
   projectId: string,
   config: { endpoint: string; apiKey: string; model: string },
-  options: { referenceStyle: string; sampleInterval?: number; concurrency?: number; maxFiles?: number; maxFrames?: number; fileIds?: string[]; refineReviewed?: boolean },
+  options: { referenceStyle: string; sampleInterval?: number; concurrency?: number; maxFiles?: number; maxFrames?: number; maxRuntimeSeconds?: number; fileIds?: string[]; refineReviewed?: boolean },
   onProgress: (job: PreprocessJob) => void,
   registerCancel: (cancel: () => void) => void
 ): Promise<PreprocessJob> {

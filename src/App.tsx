@@ -28,6 +28,7 @@ import {
   Settings2,
   ShieldCheck,
   Sparkles,
+  Square,
   Sun,
   Trash2,
   Upload,
@@ -36,8 +37,8 @@ import {
   X
 } from "lucide-react";
 import { clampDuration, curatedIdeas, formatBytes, formatTime, toAsset } from "./services/analyzer";
-import { addAssets, cancelRenderJob, checkAiModel, deleteProject, estimateFastIndex, estimatePreprocess, findPublicAudio, generateDraft, getDiagnostics, getFastIndexJob, getProject, importPublicAudio, ingestFiles, ingestLocalFolder, issueFromError, listProjects, localMediaUrl, pauseFastIndexJob, pauseIngestJob, pausePreprocessJob, pauseRenderJob, reconcileProject, renderDraft, requestAdvancedAdvice, requestVisionReview, resumeFastIndexJob, resumeIngestJob, resumePreprocessJob, resumeRenderJob, reviewDraft, runFastIndex, runPreprocess, updateDraft } from "./services/api";
-import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestProgress, MediaAsset, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, Stage, VideoIdea } from "./types";
+import { addAssets, cancelRenderJob, checkAiModel, confirmHighlightMoment, deleteProject, estimateFastIndex, estimatePreprocess, findPublicAudio, generateDraft, getDiagnostics, getFastIndexJob, getProject, importPublicAudio, ingestFiles, ingestLocalFolder, issueFromError, listProjects, localMediaUrl, markHighlightReviewed, pauseFastIndexJob, pauseIngestJob, pausePreprocessJob, pauseRenderJob, reconcileProject, rejectHighlightMoment, removeHighlightConfirmation, renderDraft, requestAdvancedAdvice, requestVisionReview, resumeFastIndexJob, resumeIngestJob, resumePreprocessJob, resumeRenderJob, reviewDraft, runFastIndex, runPreprocess, updateDraft } from "./services/api";
+import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestProgress, MediaAsset, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, Segment, Stage, VideoIdea } from "./types";
 
 const suggestions = [
   "Make it more cinematic",
@@ -49,6 +50,65 @@ type AiConfig = { endpoint: string; apiKey: string; model: string };
 type VisionReviewMode = "light" | "balanced" | "thorough";
 type AiResourceLimits = { maxVisionWorkers: number; maxFramesPerVideo: number; maxVideosPerRun: number };
 type PauseTask = "ingest" | "fast-index" | "vision" | "render";
+type HighlightReviewItem = {
+  id: string;
+  file: MediaAsset;
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  state?: string;
+  action?: string;
+  storyRole?: string;
+  source: string;
+  label: string;
+  confidence: "high" | "medium" | "low";
+  confirmed: boolean;
+  reviewed?: boolean;
+};
+type HighlightReviewSession = {
+  items: HighlightReviewItem[];
+  index: number;
+  total: number;
+  reviewed: number;
+  confirmed: number;
+};
+type ConfirmedHighlightMoment = {
+  start: number;
+  end: number;
+  duration?: number;
+  score?: number;
+  state?: string;
+  action?: string;
+  storyRole?: string;
+  source?: string;
+};
+type HighlightSidebarPart = {
+  id: string;
+  file: MediaAsset;
+  start: number;
+  end: number;
+  action?: string;
+  source?: string;
+  status: "pending" | "confirmed";
+  confidence?: "high" | "medium" | "low";
+  item?: HighlightReviewItem;
+  moment?: ConfirmedHighlightMoment;
+};
+type MusicCoveragePrompt = {
+  idea: VideoIdea;
+  clipDuration: number;
+  musicDuration: number;
+  musicName: string;
+  clipCount: number;
+};
+type ReviewMusicCoveragePrompt = {
+  clipDuration: number;
+  musicDuration: number;
+  musicName: string;
+  clipCount: number;
+};
+type HighlightDiscard = { fileId: string; start: number; end: number; duration: number; source: string; reason: "skip-this-time" };
 const semanticReviewVersion = 2;
 const maxSemanticReviewAttempts = 2;
 const defaultTextAi: AiConfig = { endpoint: "https://api.openai.com/v1/chat/completions", apiKey: "", model: "gpt-4.1-mini" };
@@ -141,14 +201,6 @@ function loadAiConfig(key: string, fallback: AiConfig, legacy = false) {
   }
 }
 
-function suggestVideoSelection(files: MediaAsset[]) {
-  return [...files]
-    .filter((file) => !/vision reviewed|created with highlightai|highlightai export|trailer - vision|assets\.json|^warsaw\b.*trailer/i.test(file.name))
-    .sort((a, b) => (b.metadata?.indexScore || b.metadata?.semanticScore || b.metadata?.actionScore || 0) - (a.metadata?.indexScore || a.metadata?.semanticScore || a.metadata?.actionScore || 0))
-    .slice(0, Math.min(12, Math.max(5, files.length)))
-    .map((file) => file.id);
-}
-
 function usefulTags(file: MediaAsset) {
   const tags = new Set<string>();
   const ignored = new Set(["unknown", "none", "gameplay", "gameplay highlight", "action", "combat", "payoff", "setup", "spectacle", "environment", "exploration", "other"]);
@@ -167,16 +219,92 @@ function usefulTags(file: MediaAsset) {
   return [...tags].slice(0, 6);
 }
 
+function metadataIntervalEnd(item: { start?: number; end?: number; duration?: number }) {
+  const start = Number(item?.start) || 0;
+  return Number(item?.end) || start + (Number(item?.duration) || 0);
+}
+
+function overlapsRejectedMoment(metadata: MediaAsset["metadata"], start = 0, end = start) {
+  return (metadata?.rejectedHighlightMoments || []).some((item) =>
+    item.reason === "not-highlight" &&
+    Math.max(Number(item.start) || 0, start) < Math.min(metadataIntervalEnd(item), end) - 0.75
+  );
+}
+
+function hasStrongSemanticSummary(metadata: MediaAsset["metadata"]) {
+  if (!metadata) return false;
+  if (hasBoringSemanticEvidence({ metadata } as MediaAsset)) return false;
+  const rating = metadata.semanticRating || null;
+  const traits = metadata.semanticTraits || null;
+  if (!rating || !traits) return false;
+  const reject = String(rating.excludeReason || "none").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "boring_travel", "walking", "waiting", "weak_aim", "unreadable", "duplicate"]);
+  if (hardRejects.has(reject)) return false;
+  if (Number(rating.boredom || 0) >= 60) return false;
+  if (Number(traits.clarity || 0) < 60 || Number(traits.obstruction || 0) > 50) return false;
+  const text = `${traits.action || ""} ${metadata.semanticRejectReason || ""} ${(metadata.semanticTags || []).join(" ")}`.toLowerCase();
+  const strongScore = Number(metadata.semanticScore || 0) >= 70
+    || (Number(rating.trailerUsefulness || 0) >= 70 && (Number(traits.intensity || 0) >= 70 || Number(traits.spectacle || 0) >= 70));
+  const decisiveText = /explosion|destroy|destruction|detonat|sniper|headshot|vehicle|air combat|shoot|shot|objective|capture|kill/i.test(text)
+    && Number(traits.intensity || 0) >= 70;
+  return strongScore || decisiveText || (traits.payoffVerified === true && Number(metadata.semanticScore || 0) >= 70);
+}
+
+function hasFinalSemanticReview(file: MediaAsset) {
+  const metadata = file.metadata;
+  if (!metadata || metadata.semanticReviewLastError) return false;
+  const attemptVersion = Number(metadata.semanticReviewAttemptVersion || 0);
+  const attempts = attemptVersion === semanticReviewVersion ? Number(metadata.semanticReviewAttempts || 0) : 0;
+  return metadata.semanticFineReviewed === true || attempts >= maxSemanticReviewAttempts;
+}
+
+function hasBoringSemanticEvidence(file: MediaAsset) {
+  const metadata = file.metadata;
+  if (!metadata || !hasFinalSemanticReview(file)) return false;
+  if ((metadata.confirmedHighlightMoments || []).length > 0) return false;
+  const rating = metadata.semanticRating || null;
+  const reject = String(rating?.excludeReason || metadata.semanticRejectReason || "").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "unreadable", "duplicate"]);
+  if (reject.split(/[^a-z_]+/).some((part) => hardRejects.has(part))) return true;
+  const reason = String(metadata.semanticRejectReason || "").toLowerCase();
+  if (/\b(menu|scoreboard|loading screen|map screen|death screen|unreadable|duplicate)\b/i.test(reason)) return true;
+  return false;
+}
+
+function hasRecoverableGameplaySignal(file: MediaAsset) {
+  const metadata = file.metadata;
+  if (!metadata?.duration || metadata.videoCodec === "pending") return false;
+  if (hasBoringSemanticEvidence(file)) return false;
+  return Number(metadata.indexScore || 0) >= 30 || Number(metadata.actionScore || 0) >= 20;
+}
+
+function hasAutoUsableHighlightCandidate(file: MediaAsset) {
+  const metadata = file.metadata;
+  if (!metadata) return false;
+  if (metadata.aiDecision === "rejected" || hasBoringSemanticEvidence(file)) return false;
+  if (metadata.aiDecision === "confirmed") return true;
+  if ((metadata.confirmedHighlightMoments || []).length > 0) return true;
+  if ((metadata.semanticCandidateHistory || []).some((event) => Number(event.score || 0) >= 64 && !overlapsRejectedMoment(metadata, Number(event.start) || 0, metadataIntervalEnd(event)))) return true;
+  if ((metadata.candidateWindows || []).some((window) => Number(window.score || 0) >= 72 && !overlapsRejectedMoment(metadata, Number(window.start) || 0, metadataIntervalEnd(window)))) return true;
+  return hasStrongSemanticSummary(metadata) || hasRecoverableGameplaySignal(file);
+}
+
 function semanticState(file: MediaAsset) {
   const metadata = file.metadata;
   if (!metadata?.duration || metadata.videoCodec === "pending") return "pending";
+  if (metadata.aiDecision === "rejected" || hasBoringSemanticEvidence(file)) return "rejected";
+  if (metadata.aiDecision === "confirmed") return "verified";
   const reviewedFrames = Number(metadata.semanticFramesReviewed || 0);
   const attempts = semanticReviewAttempts(file);
   const verifiedEvents = (metadata.semanticEvents || []).filter((event) => event.payoffVerified === true).length;
   const strongVisionScore = metadata.visionApproved === true && Number(metadata.visionScore || 0) >= 70;
   const strongSemanticScore = Number(metadata.semanticScore || 0) >= 70 &&
     (metadata.ratingSource === "vision-ai" || metadata.ratingConfidence === "high");
-  if (verifiedEvents > 0 || metadata.semanticQuality === "verified" || strongVisionScore || strongSemanticScore) return "verified";
+  const strongSummaryPayoff = metadata.semanticTraits?.payoffVerified === true &&
+    Number(metadata.semanticScore || 0) >= 70 &&
+    Number(metadata.semanticRating?.trailerUsefulness || 0) >= 70 &&
+    String(metadata.semanticRating?.excludeReason || "none").toLowerCase() === "none";
+  if (verifiedEvents > 0 || metadata.semanticQuality === "verified" || strongVisionScore || strongSemanticScore || strongSummaryPayoff) return "verified";
   if (metadata.semanticReviewLastError && reviewedFrames && Number(metadata.semanticReviewVersion || 0) >= semanticReviewVersion && metadata.semanticFineReviewed !== true) return "reviewed";
   if (Number(metadata.semanticReviewVersion || 0) >= semanticReviewVersion && metadata.semanticFineReviewed === true) return "uncertain";
   if (Number(metadata.semanticReviewVersion || 0) >= semanticReviewVersion && attempts >= maxSemanticReviewAttempts) return "uncertain";
@@ -185,24 +313,184 @@ function semanticState(file: MediaAsset) {
 }
 
 function potentialMomentRanges(file: MediaAsset) {
+  const rejected = file.metadata?.rejectedHighlightMoments || [];
+  const overlapsRejected = (item: { start?: number; end?: number; duration?: number }) => rejected.some((rejection) => {
+    const start = Number(item.start) || 0;
+    const end = Number(item.end) || start + (Number(item.duration) || 0);
+    return rejection.reason === "not-highlight" &&
+      Math.max(Number(rejection.start) || 0, start) < Math.min(Number(rejection.end) || Number(rejection.start) + Number(rejection.duration), end) - 0.75;
+  });
   const ranges = [
     ...(file.metadata?.semanticEvents || []),
     ...(file.metadata?.semanticCandidateHistory || []),
     ...(file.metadata?.candidateWindows || [])
   ]
-    .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start)
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
-    .slice(0, 3)
-    .map((item) => `${formatTime(item.start)}-${formatTime(item.end)}`);
-  return [...new Set(ranges)];
+    .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start && !overlapsRejected(item))
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+  const unique: Array<{ start: number; end: number }> = [];
+  for (const item of ranges) {
+    const candidate = { start: Number(item.start), end: Number(item.end) };
+    if (unique.some((existing) => intervalsOverlapMeaningfully(existing, candidate))) continue;
+    unique.push(candidate);
+    if (unique.length >= 3) break;
+  }
+  return unique.map((item) => `${formatTime(item.start)}-${formatTime(item.end)}`);
 }
 
 function potentialMomentSummary(file: MediaAsset) {
   const ranges = potentialMomentRanges(file);
   if (ranges.length) return `Potential moments: ${ranges.join(", ")}.`;
-  const bestTime = file.metadata?.semanticTopFrame ?? file.metadata?.highlightStart;
+  const bestTime = reliableFocusTime(file);
   if (Number.isFinite(bestTime)) return `Potential highlight near ${formatTime(bestTime || 0)}.`;
   return "";
+}
+
+function reliableFocusTime(file: MediaAsset) {
+  const metadata = (file.metadata || {}) as NonNullable<MediaAsset["metadata"]>;
+  const semanticEvents = [...(metadata.semanticEvents || []), ...(metadata.semanticCandidateHistory || [])];
+  const weakVisionMiss = Number(metadata.semanticFramesReviewed || 0) > 0 &&
+    !semanticEvents.length &&
+    (metadata.ratingConfidence === "low" || metadata.semanticQuality === "missed" || Number(metadata.semanticScore || 0) < 25);
+  if (weakVisionMiss && Number.isFinite(Number(metadata.highlightStart))) return Number(metadata.highlightStart);
+  return Number(metadata.semanticTopFrame ?? metadata.highlightStart ?? metadata.duration / 2);
+}
+
+function localSignalReviewWindow(file: MediaAsset, fallbackCenter: number, fallbackDuration: number) {
+  const metadata = file.metadata;
+  const duration = Number(metadata?.duration || 0);
+  const sustainedSignal = semanticState(file) !== "uncertain" &&
+    Number(metadata?.indexScore || 0) >= 30 &&
+    Number(metadata?.actionScore || 0) >= 15 &&
+    !(metadata?.semanticEvents || []).length &&
+    !(metadata?.semanticCandidateHistory || []).length &&
+    !(metadata?.candidateWindows || []).length;
+  if (sustainedSignal) {
+    const windowDuration = Math.min(24, Math.max(14, duration * 0.27 || 18));
+    const start = Math.max(0, Math.min(Math.max(0, duration - windowDuration), Math.ceil(fallbackCenter + 2)));
+    return { start, end: Math.min(duration || start + windowDuration, start + windowDuration) };
+  }
+  const start = Math.max(0, Math.min(duration - 1, fallbackCenter - fallbackDuration * 0.55));
+  return { start, end: Math.min(duration || start + fallbackDuration, start + fallbackDuration) };
+}
+
+function intervalsOverlapMeaningfully(a: { start: number; end: number }, b: { start: number; end: number }) {
+  const overlap = Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
+  if (overlap <= 0) return false;
+  const shorter = Math.max(1, Math.min(a.end - a.start, b.end - b.start));
+  return overlap >= 5 || overlap / shorter >= 0.35;
+}
+
+function confidenceFromScore(score: number, fallback: "high" | "medium" | "low" = "medium") {
+  if (!Number.isFinite(score)) return fallback;
+  if (score >= 82) return "high";
+  if (score >= 64) return "medium";
+  return "low";
+}
+
+function confidenceLabel(confidence?: "high" | "medium" | "low") {
+  if (confidence === "high") return "High confidence";
+  if (confidence === "low") return "Low confidence";
+  return "Medium confidence";
+}
+
+export function highlightReviewCandidates(file: MediaAsset): HighlightReviewItem[] {
+  const metadata = file.metadata;
+  if (!metadata?.duration || metadata.videoCodec === "pending") return [];
+  if (metadata.reviewed === true) return [];
+  if ((metadata.confirmedHighlightMoments || []).length > 0) return [];
+  const confirmed = metadata.confirmedHighlightMoments || [];
+  const rejected = metadata.rejectedHighlightMoments || [];
+  const overlapsConfirmed = (item: { start: number; end: number }) => confirmed.some((confirmation) => {
+    const start = Number(confirmation.start) || 0;
+    const end = Number(confirmation.end) || start + (Number(confirmation.duration) || 0);
+    return intervalsOverlapMeaningfully({ start, end }, item);
+  });
+  const overlapsRejected = (item: { start: number; end: number }) => rejected.some((rejection) =>
+    rejection.reason === "not-highlight" &&
+    Math.max(Number(rejection.start) || 0, item.start) < Math.min(Number(rejection.end) || Number(rejection.start) + Number(rejection.duration), item.end) - 0.75
+  );
+  const state = semanticState(file);
+  const verifiedEvents = (metadata.semanticEvents || [])
+    .filter((event) => event.payoffVerified === true)
+    .map((event) => ({
+      start: Number(event.start) || 0,
+      end: Number(event.end) || 0,
+      score: Number(event.score) || Number(metadata.semanticScore) || 80,
+      state: event.state,
+      action: event.action,
+      storyRole: event.storyRole || event.payoffStage || "payoff",
+      source: "vision",
+      label: "AI verified",
+      confidence: "high" as const
+    }));
+  const potentialEvents = [
+    ...(metadata.semanticCandidateHistory || []).map((event) => ({
+      start: Number(event.start) || 0,
+      end: Number(event.end) || 0,
+      score: Number(event.score) || Number(metadata.semanticScore) || 65,
+      state: event.state,
+      action: event.action,
+      storyRole: event.storyRole || event.payoffStage || "candidate",
+      source: "vision-candidate",
+      label: state === "verified" ? "AI candidate" : "Potential highlight",
+      confidence: (Number(event.score) || Number(metadata.semanticScore) || 65) >= 64 ? "medium" as const : "low" as const
+    })),
+    ...(metadata.candidateWindows || []).map((window) => ({
+      start: Number(window.start) || 0,
+      end: Number(window.end) || (Number(window.start) || 0) + (Number(window.duration) || 8),
+      score: Number(window.score) || Number(metadata.indexScore) || 55,
+      state: "indexed",
+      action: window.reason,
+      storyRole: window.storyRole || "candidate",
+      source: "index",
+      label: state === "verified" ? "Indexed backup" : "Potential highlight",
+      confidence: confidenceFromScore(Number(window.score) || Number(metadata.indexScore) || 55, "low")
+    }))
+  ];
+  const fallbackCenter = reliableFocusTime(file);
+  const fallbackDuration = state === "uncertain" ? 12 : 8;
+  const { start: fallbackStart, end: fallbackEnd } = localSignalReviewWindow(file, fallbackCenter, fallbackDuration);
+  const shouldAddFallback = (state === "uncertain" || hasRecoverableGameplaySignal(file)) && !verifiedEvents.length && !potentialEvents.length && fallbackEnd > fallbackStart;
+  const fallbackEvents = shouldAddFallback
+    ? [{
+        start: fallbackStart,
+        end: fallbackEnd,
+        score: Number(metadata.semanticScore) || Number(metadata.indexScore) || 50,
+        state: state === "uncertain" ? "uncertain" : "local-signal",
+        action: state === "uncertain" ? "manual review needed" : "local highlight signal",
+        storyRole: "candidate",
+        source: state === "uncertain" ? "ai-uncertain" : "local-signal",
+        label: state === "uncertain" ? "AI uncertain" : "Local signal",
+        confidence: confidenceFromScore(Number(metadata.semanticScore) || Number(metadata.indexScore) || 50, "low")
+      }]
+    : [];
+  const base = verifiedEvents.length ? verifiedEvents : [...potentialEvents, ...fallbackEvents];
+  const unique: HighlightReviewItem[] = [];
+  for (const item of base
+    .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start && !overlapsConfirmed(item) && !overlapsRejected(item))
+    .sort((a, b) => b.score - a.score)) {
+    const start = Math.max(0, Math.min(metadata.duration, item.start));
+    const end = Math.max(start + 1, Math.min(metadata.duration, item.end));
+    const id = `${file.id}:${item.source}:${Math.round(start * 10)}:${Math.round(end * 10)}`;
+    if (unique.some((candidate) => candidate.id === id)) continue;
+    if (unique.some((candidate) => intervalsOverlapMeaningfully(candidate, { start, end }))) continue;
+    unique.push({
+      id,
+      file,
+      start,
+      end,
+      duration: end - start,
+      score: Math.round(item.score),
+      state: item.state,
+      action: item.action,
+      storyRole: item.storyRole,
+      source: item.source,
+      label: item.label,
+      confidence: item.label === "AI verified" ? "high" : item.confidence,
+      confirmed: false
+    });
+  }
+  return unique;
 }
 
 function semanticReviewAttempts(file: MediaAsset) {
@@ -258,7 +546,8 @@ export function chooseDiversifiedClips(
   const eligible = files.filter((file) =>
     !looksLikeGeneratedExport(file.name) &&
     file.metadata?.duration &&
-    file.metadata.videoCodec !== "pending"
+    file.metadata.videoCodec !== "pending" &&
+    semanticState(file) !== "rejected"
   );
   const target = Math.min(limit, eligible.length);
   const selected: MediaAsset[] = [];
@@ -309,12 +598,37 @@ function looksLikeGeneratedExport(name: string) {
   return /vision reviewed|created with highlightai|highlightai export|trailer - vision|assets\.json|^warsaw\b.*trailer/i.test(name);
 }
 
+function isSelectableSourceClip(file: MediaAsset) {
+  return !looksLikeGeneratedExport(file.name) &&
+    Boolean(file.metadata?.duration) &&
+    file.metadata?.videoCodec !== "pending" &&
+    semanticState(file) !== "rejected";
+}
+
 function normalizeAssets(assets: MediaAsset[]) {
   return assets.map((file) => ({
     ...file,
     type: file.name.match(/\.(mp3|wav|m4a|aac|flac|ogg)$/i) ? "audio" as const : "image" as const,
     source: file.source || "local-asset"
   }));
+}
+
+function assetDuration(asset: MediaAsset | null) {
+  return Number(asset?.duration || asset?.metadata?.duration || 0);
+}
+
+function effectiveMusicDuration(asset: MediaAsset | null, repeats: number) {
+  const duration = assetDuration(asset);
+  if (!duration) return 0;
+  return Math.min(300, duration * Math.max(1, repeats || 1));
+}
+
+function totalSourceClipDuration(files: MediaAsset[]) {
+  return Math.round(files.reduce((sum, file) => sum + Math.max(0, Number(file.metadata?.duration) || 0), 0) * 10) / 10;
+}
+
+function totalSegmentDuration(segments: Segment[]) {
+  return Math.round(segments.reduce((sum, segment) => sum + Math.max(0, Number(segment.duration) || 0), 0) * 10) / 10;
 }
 
 function App() {
@@ -339,11 +653,14 @@ function App() {
     return saved === "list" || saved === "detail" ? saved : "grid";
   });
   const [theme, setTheme] = useState<"dark" | "light">(() => localStorage.getItem("highlight-ai-theme") === "light" ? "light" : "dark");
+  const [appRoute, setAppRoute] = useState<"dashboard" | "review">(() => window.location.pathname === "/review" ? "review" : "dashboard");
   const [previewVideo, setPreviewVideo] = useState<{ title: string; url: string; generated?: boolean; localPath?: string } | null>(null);
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
   const [assetBrowser, setAssetBrowser] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [generatedLibraryOpen, setGeneratedLibraryOpen] = useState(false);
+  const [musicCoveragePrompt, setMusicCoveragePrompt] = useState<MusicCoveragePrompt | null>(null);
+  const [reviewMusicCoveragePrompt, setReviewMusicCoveragePrompt] = useState<ReviewMusicCoveragePrompt | null>(null);
   const [assetQuery, setAssetQuery] = useState("cinematic gaming");
   const [publicAudio, setPublicAudio] = useState<PublicAudio[]>([]);
   const [advancedAdvice, setAdvancedAdvice] = useState("");
@@ -359,6 +676,15 @@ function App() {
   const [pausePending, setPausePending] = useState<Partial<Record<PauseTask, boolean>>>({});
   const [selectedVideoIds, setSelectedVideoIds] = useState<string[]>([]);
   const [selectedAudioAssetId, setSelectedAudioAssetId] = useState("");
+  const [musicRepeats, setMusicRepeats] = useState<1 | 2>(1);
+  const [highlightReview, setHighlightReview] = useState<HighlightReviewSession | null>(null);
+  const [highlightReviewPlaying, setHighlightReviewPlaying] = useState(false);
+  const [highlightTrim, setHighlightTrim] = useState<{ start: number; end: number } | null>(null);
+  const [highlightSessionDiscards, setHighlightSessionDiscards] = useState<HighlightDiscard[]>([]);
+  const [pendingHighlightGenerateIdea, setPendingHighlightGenerateIdea] = useState<VideoIdea | null>(null);
+  const [pendingReviewDraftId, setPendingReviewDraftId] = useState("");
+  const [reviewGeneratePrompt, setReviewGeneratePrompt] = useState(false);
+  const [reviewGeneratePromptDismissed, setReviewGeneratePromptDismissed] = useState(false);
   const [visionModelStatus, setVisionModelStatus] = useState<AiModelStatus | null>(null);
   const [textModelStatus, setTextModelStatus] = useState<AiModelStatus | null>(null);
   const [autoAiStatus, setAutoAiStatus] = useState<{ state: "idle" | "waiting" | "vision" | "text" | "complete" | "error"; message: string }>({
@@ -386,13 +712,26 @@ function App() {
   const cancelFastIndex = useRef<() => void>(() => undefined);
   const cancelPreprocess = useRef<() => void>(() => undefined);
   const cancelRender = useRef<() => void>(() => undefined);
+  const highlightReviewVideo = useRef<HTMLVideoElement>(null);
+  const highlightReviewFrame = useRef<number | null>(null);
   const clipPageSentinel = useRef<HTMLDivElement>(null);
   const autoAiAttempt = useRef("");
   const luckySelectionHistory = useRef<string[][]>([]);
 
+  function noticeFromError(error: unknown, fallback: string) {
+    const issue = issueFromError(error);
+    return issue.message || fallback;
+  }
+
   useEffect(() => {
     void listProjects().then(setRecentProjects).catch(() => undefined);
     void getDiagnostics().then(setDiagnostics).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const syncRoute = () => setAppRoute(window.location.pathname === "/review" ? "review" : "dashboard");
+    window.addEventListener("popstate", syncRoute);
+    return () => window.removeEventListener("popstate", syncRoute);
   }, []);
 
   useEffect(() => {
@@ -403,6 +742,11 @@ function App() {
   useEffect(() => {
     localStorage.setItem("highlight-ai-library-view", libraryView);
   }, [libraryView]);
+
+  useEffect(() => {
+    setMusicCoveragePrompt(null);
+    setReviewMusicCoveragePrompt(null);
+  }, [selectedAudioAssetId, musicRepeats, selectedVideoIds.join("|")]);
 
   useEffect(() => {
     if (!project?.id) return;
@@ -448,7 +792,11 @@ function App() {
     if (!target || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) {
-        setVisibleClipLimit((current) => current + 40);
+        setVisibleClipLimit((current) => {
+          const maxVisible = Math.max(0, visibleLibrary.length);
+          if (current >= maxVisible) return current;
+          return Math.min(current + 40, maxVisible);
+        });
       }
     }, { rootMargin: "500px 0px" });
     observer.observe(target);
@@ -458,6 +806,10 @@ function App() {
   useEffect(() => {
     const closeModal = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (appRoute === "review") {
+        navigateToDashboard();
+        return;
+      }
       if (previewVideo) setPreviewVideo(null);
       else if (generatedLibraryOpen) setGeneratedLibraryOpen(false);
       else if (settingsOpen) setSettingsOpen(false);
@@ -465,7 +817,31 @@ function App() {
     };
     window.addEventListener("keydown", closeModal);
     return () => window.removeEventListener("keydown", closeModal);
-  }, [assetBrowser, generatedLibraryOpen, previewVideo, settingsOpen]);
+  }, [appRoute, assetBrowser, generatedLibraryOpen, previewVideo, settingsOpen]);
+
+  useEffect(() => {
+    const current = highlightReview?.items[highlightReview.index];
+    if (highlightReviewFrame.current !== null) {
+      window.cancelAnimationFrame(highlightReviewFrame.current);
+      highlightReviewFrame.current = null;
+    }
+    if (!current) {
+      setHighlightTrim(null);
+      setHighlightReviewPlaying(false);
+      return;
+    }
+    setHighlightTrim({ start: current.start, end: current.end });
+    setHighlightReviewPlaying(false);
+    window.setTimeout(() => {
+      const video = highlightReviewVideo.current;
+      if (!video) return;
+      video.currentTime = current.start;
+    }, 0);
+  }, [highlightReview?.index, highlightReview?.items]);
+
+  useEffect(() => () => {
+    if (highlightReviewFrame.current !== null) window.cancelAnimationFrame(highlightReviewFrame.current);
+  }, []);
 
   useEffect(() => {
     if (!project || stage !== "advice") return;
@@ -499,12 +875,17 @@ function App() {
         Number(file.metadata?.semanticFramesReviewed || 0) > 0
       );
       const eventsFound = reviewedFiles.reduce((sum, file) => sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
-      const uncertainFiles = reviewedFiles.filter((file) => semanticState(file) === "uncertain").length;
+      const confirmedFiles = reviewedFiles.filter((file) => semanticState(file) === "verified" || hasAutoUsableHighlightCandidate(file)).length;
+      const rejectedFiles = reviewedFiles.filter((file) => semanticState(file) === "rejected").length;
+      const uncertainFiles = reviewedFiles.filter((file) =>
+        semanticState(file) === "uncertain" &&
+        !hasAutoUsableHighlightCandidate(file)
+      ).length;
       setAutoAiStatus({
         state: "complete",
         message: uncertainFiles
-          ? `Vision AI verified ${eventsFound} complete highlight event${eventsFound === 1 ? "" : "s"}. ${uncertainFiles} clip${uncertainFiles === 1 ? " is" : "s are"} uncertain after ${maxSemanticReviewAttempts} checks. Nothing is running.`
-          : `Vision AI finished reviewing ${reviewedFiles.length} videos and verified ${eventsFound} complete highlight event${eventsFound === 1 ? "" : "s"}. Nothing is running.`
+          ? `Vision AI confirmed ${confirmedFiles} highlight-ready clip${confirmedFiles === 1 ? "" : "s"} and rejected ${rejectedFiles} low-signal clip${rejectedFiles === 1 ? "" : "s"}. ${uncertainFiles} clip${uncertainFiles === 1 ? " is" : "s are"} still low confidence. Nothing is running.`
+          : `Vision AI confirmed ${confirmedFiles} highlight-ready clip${confirmedFiles === 1 ? "" : "s"} and rejected ${rejectedFiles} low-signal clip${rejectedFiles === 1 ? "" : "s"}. Nothing is running.`
       });
       return;
     }
@@ -651,7 +1032,7 @@ function App() {
     setSelectedAudioAssetId(assets.find((asset) => asset.type === "audio")?.id || "");
     setDrafts(next.drafts);
     setActiveDraft(Math.max(0, next.drafts.length - 1));
-    setSelectedVideoIds(suggestVideoSelection(next.files));
+    setSelectedVideoIds([]);
     if (next.fastIndex?.jobId) {
       void getFastIndexJob(next.fastIndex.jobId).then(setFastIndexJob).catch(() => setFastIndexJob(null));
     } else {
@@ -687,7 +1068,14 @@ function App() {
     setDrafts(next.drafts || []);
     setActiveDraft(Math.max(0, (next.drafts || []).length - 1));
     const nextIds = new Set(next.files.map((file) => file.id));
-    setSelectedVideoIds((current) => preserveSelection && current.length && current.every((id) => nextIds.has(id)) ? current : suggestVideoSelection(next.files));
+    setSelectedVideoIds((current) =>
+      preserveSelection && current.length
+        ? current.filter((id) => {
+            const file = next.files.find((item) => item.id === id);
+            return file && nextIds.has(id) && isSelectableSourceClip(file);
+          })
+        : []
+    );
     setRecentProjects((current) => [next, ...current.filter((item) => item.id !== next.id)].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
     setStage("advice");
     const indexReady = ["completed", "completed_with_warnings"].includes(String(next.fastIndex?.status || ""));
@@ -706,7 +1094,7 @@ function App() {
       resumeProject(fresh);
     } catch (error) {
       setOperationIssue(issueFromError(error));
-      setNotice(error instanceof Error ? error.message : "Could not load that saved path.");
+      setNotice(noticeFromError(error, "Could not load that saved path."));
     } finally {
       setBusy("");
     }
@@ -721,7 +1109,7 @@ function App() {
       if (project?.id === next.id) reset();
       setNotice(`${next.name} was removed from HighlightAI. Original source files were preserved.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not remove this folder.");
+      setNotice(noticeFromError(error, "Could not remove this folder."));
     }
   }
 
@@ -731,7 +1119,7 @@ function App() {
       setBusy("Searching Creative Commons audio...");
       setPublicAudio(await findPublicAudio(assetQuery));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not search public audio.");
+      setNotice(noticeFromError(error, "Could not search public audio."));
     } finally {
       setBusy("");
     }
@@ -750,7 +1138,7 @@ function App() {
       setAssetBrowser(false);
       setNotice(`${audio.title} is selected as the soundtrack.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not import public audio.");
+      setNotice(noticeFromError(error, "Could not import public audio."));
     } finally {
       setBusy("");
     }
@@ -791,7 +1179,7 @@ function App() {
       const result = await ingestFiles(pendingFiles, setIngestProgress, (cancel) => { cancelIngest.current = cancel; });
       setProject(result.project);
       setRecordings(result.project.files.map((file) => ({ ...file, type: "video", source: "recording" })));
-      setSelectedVideoIds(suggestVideoSelection(result.project.files));
+      setSelectedVideoIds([]);
       setAnalysis(result.analysis);
       if (result.job.failures.length) setNotice(`${result.project.files.length} videos are ready. ${result.job.failures.length} unreadable video${result.job.failures.length === 1 ? " was" : "s were"} skipped.`);
       setStage("advice");
@@ -864,7 +1252,7 @@ function App() {
       setNotice(next.status === "paused" ? "Import paused after saving completed files." : "Import resumed from saved progress.");
     } catch (error) {
       setIngestProgress(previous);
-      setNotice(error instanceof Error ? error.message : "Could not change the import state.");
+      setNotice(noticeFromError(error, "Could not change the import state."));
     } finally {
       setPausePending((current) => ({ ...current, ingest: false }));
     }
@@ -888,23 +1276,258 @@ function App() {
       if (addedAudio) setSelectedAudioAssetId(addedAudio.id);
       setNotice(addedAudio ? `${addedAudio.name} is selected as the soundtrack.` : `${list.length} local asset${list.length === 1 ? "" : "s"} added.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not add assets.");
+      setNotice(noticeFromError(error, "Could not add assets."));
     } finally {
       setBusy("");
     }
   }
 
-  async function createDraft(idea: VideoIdea) {
-    if (!project) return;
-    if (!selectedVideoIds.length) {
-      setNotice("Select at least one video before creating a trailer.");
+  function isSessionDiscardedCandidate(item: HighlightReviewItem) {
+    return highlightSessionDiscards.some((discard) =>
+      discard.fileId === item.file.id &&
+      Math.max(discard.start, item.start) < Math.min(discard.end, item.end) - 0.75
+    );
+  }
+
+  function isAlreadyConfirmedCandidate(item: HighlightReviewItem) {
+    return (item.file.metadata?.confirmedHighlightMoments || []).some((moment) => {
+      const start = Number(moment.start) || 0;
+      const end = Number(moment.end) || start + (Number(moment.duration) || 0);
+      return intervalsOverlapMeaningfully({ start, end }, item);
+    });
+  }
+
+  function candidateItemsForReview(files: MediaAsset[]) {
+    return files
+      .flatMap(highlightReviewCandidates)
+      .filter((item) => !isAlreadyConfirmedCandidate(item) && !isSessionDiscardedCandidate(item))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function optionalReviewItems(files: MediaAsset[], limit = 10) {
+    const items = candidateItemsForReview(files);
+    const uncertain = items.filter((item) => item.label !== "AI verified" && item.confidence !== "high");
+    return (uncertain.length ? uncertain : items).slice(0, limit);
+  }
+
+  function navigateToReviewPage() {
+    if (window.location.pathname !== "/review") window.history.pushState(null, "", "/review");
+    setAppRoute("review");
+  }
+
+  function navigateToDashboard() {
+    if (window.location.pathname === "/review") window.history.pushState(null, "", "/");
+    setAppRoute("dashboard");
+  }
+
+  function makeHighlightReviewSession(items: HighlightReviewItem[], overrides: Partial<HighlightReviewSession> = {}): HighlightReviewSession {
+    const reviewed = Math.max(0, overrides.reviewed ?? items.filter((item) => item.reviewed).length);
+    const confirmed = Math.max(0, overrides.confirmed ?? items.filter((item) => item.confirmed || item.reviewed && item.confirmed).length);
+    return {
+      items,
+      index: Math.max(0, Math.min(items.length - 1, overrides.index ?? 0)),
+      total: Math.max(overrides.total ?? items.length, items.length),
+      reviewed,
+      confirmed
+    };
+  }
+
+  function beginHighlightReview(items: HighlightReviewItem[], message: string) {
+    setReviewGeneratePrompt(false);
+    setReviewGeneratePromptDismissed(false);
+    setHighlightReview(makeHighlightReviewSession(items));
+    setHighlightTrim(items[0] ? { start: items[0].start, end: items[0].end } : null);
+    navigateToReviewPage();
+    setNotice(message);
+  }
+
+  function draftSegmentsToReviewItems(draft: Draft, files: MediaAsset[], source = "draft-plan") {
+    const fileById = new Map(files.map((file) => [file.id, file]));
+    return (draft.segments || [])
+      .map((segment, index) => {
+        const file = fileById.get(segment.fileId);
+        if (!file?.metadata?.duration) return null;
+        const duration = Number(file.metadata.duration) || 0;
+        const start = Math.max(0, Math.min(Math.max(0, duration - 1), Number(segment.start) || 0));
+        const rawEnd = start + Math.max(1, Number(segment.duration) || 1);
+        const end = Math.max(start + 1, Math.min(duration || rawEnd, rawEnd));
+        const alreadyReviewed = file.metadata?.reviewed === true;
+        return {
+          id: `${file.id}:${source}:${draft.id}:${index}:${Math.round(start * 10)}:${Math.round(end * 10)}`,
+          file,
+          start,
+          end,
+          duration: end - start,
+          score: Math.round(Number(segment.score) || Number(file.metadata.semanticScore) || Number(file.metadata.indexScore) || 65),
+          state: "planned",
+          action: segment.storyRole || "planned highlight",
+          storyRole: segment.storyRole || "candidate",
+          source: segment.source || source,
+          label: source === "final-review" ? "Final review" : "Planned cut",
+          confidence: segment.confidence || confidenceFromScore(Number(segment.score) || Number(file.metadata.semanticScore) || Number(file.metadata.indexScore) || 65, "medium"),
+          confirmed: alreadyReviewed,
+          reviewed: alreadyReviewed
+        } as HighlightReviewItem;
+      })
+      .filter(Boolean) as HighlightReviewItem[];
+  }
+
+  function beginDraftSegmentReview(draft: Draft, sourceProject: Project, message = "Review the planned parts, trim weak edges, then generate the video.") {
+    const items = draftSegmentsToReviewItems(draft, sourceProject.files);
+    setPendingReviewDraftId(draft.id);
+    setPendingHighlightGenerateIdea(null);
+    setReviewGeneratePrompt(false);
+    setReviewGeneratePromptDismissed(false);
+    if (!items.length) {
+      setHighlightReview(null);
+      setHighlightTrim(null);
+      navigateToDashboard();
+      setNotice("The draft did not contain usable planned cuts. Choose stronger clips or run Vision AI again.");
       return;
     }
-    const notReady = selectedVideos.filter((file) => !file.metadata?.duration || file.metadata.videoCodec === "pending");
+    setHighlightReview(makeHighlightReviewSession(items, { total: items.length }));
+    setHighlightTrim({ start: items[0].start, end: items[0].end });
+    navigateToReviewPage();
+    setNotice(message);
+  }
+
+  function confirmedReviewItemsToSegments(session: HighlightReviewSession): Segment[] {
+    return session.items
+      .filter((item) => item.confirmed && item.end - item.start >= 1)
+      .map((item) => ({
+        fileId: item.file.id,
+        start: Math.round(item.start * 10) / 10,
+        duration: Math.round((item.end - item.start) * 10) / 10,
+        minDuration: Math.min(Math.round((item.end - item.start) * 10) / 10, Math.max(1, Number(item.duration || item.end - item.start))),
+        score: Math.round(Number(item.score) || Number(item.file.metadata?.semanticScore) || Number(item.file.metadata?.indexScore) || 70),
+        storyRole: item.storyRole || "approved highlight",
+        source: item.source === "draft-plan" ? "human-reviewed" : item.source || "human-reviewed",
+        confidence: "high"
+      }));
+  }
+
+  function confirmedMomentToReviewItem(file: MediaAsset, moment: ConfirmedHighlightMoment): HighlightReviewItem {
+    const start = Number(moment.start) || 0;
+    const end = Number(moment.end) || start + (Number(moment.duration) || 0);
+    return {
+      id: `confirmed-review:${file.id}:${Math.round(start * 10)}:${Math.round(end * 10)}`,
+      file,
+      start,
+      end,
+      duration: Math.max(1, end - start),
+      score: Math.round(Number(moment.score) || Number(file.metadata?.semanticScore) || Number(file.metadata?.indexScore) || 80),
+      state: moment.state,
+      action: moment.action || "user verified highlight",
+      storyRole: moment.storyRole || "payoff",
+      source: moment.source || "user-verified",
+      label: "user verified",
+      confidence: "high",
+      confirmed: true,
+      reviewed: true
+    };
+  }
+
+  function isDuplicateReviewItem(item: HighlightReviewItem, existing: HighlightReviewItem[]) {
+    return existing.some((candidate) =>
+      candidate.id === item.id ||
+      candidate.file.id === item.file.id
+    );
+  }
+
+  function beginFinalReviewDecision(job: RenderJob, reviewedDraft?: Draft) {
+    if (!project) return;
+    const request = job.reviewRequest;
+    const fileById = new Map(project.files.map((file) => [file.id, file]));
+    const fileIds = request?.fileIds?.length
+      ? request.fileIds
+      : reviewedDraft?.fileIds?.length
+        ? reviewedDraft.fileIds
+        : selectedVideoIds;
+    const reviewItems = (request?.segments || [])
+      .map((segment, index) => {
+        const file = fileById.get(segment.fileId);
+        if (!file || !file.metadata?.duration) return null;
+        const start = Math.max(0, Math.min(Number(file.metadata.duration) - 1, Number(segment.start) || 0));
+        const end = Math.max(start + 1, Math.min(Number(file.metadata.duration), start + (Number(segment.duration) || 6)));
+        return {
+          id: `${file.id}:final-review:${index}:${Math.round(start * 10)}:${Math.round(end * 10)}`,
+          file,
+          start,
+          end,
+          duration: end - start,
+          score: Math.round(Number(segment.score) || Number(file.metadata.indexScore) || Number(file.metadata.semanticScore) || 60),
+          state: "final-review",
+          action: segment.storyRole || "final review candidate",
+          storyRole: segment.storyRole || "candidate",
+          source: segment.source || "final-review",
+          label: "Final review",
+          confidence: segment.confidence || "low"
+        } as HighlightReviewItem;
+      })
+      .filter(Boolean) as HighlightReviewItem[];
+    const fallbackItems = candidateItemsForReview(fileIds.map((id) => fileById.get(id)).filter(Boolean) as MediaAsset[]);
+    const items = reviewItems.length ? reviewItems : fallbackItems.slice(0, 12);
+    if (fileIds.length) setSelectedVideoIds([...new Set(fileIds)]);
+    if (reviewedDraft) {
+      setPendingReviewDraftId(reviewedDraft.id);
+      setPendingHighlightGenerateIdea(null);
+      setReviewGeneratePrompt(false);
+      setReviewGeneratePromptDismissed(false);
+      setDrafts((current) => current.map((item) => item.id === reviewedDraft.id ? reviewedDraft : item));
+      setProject((current) => current ? { ...current, drafts: current.drafts.map((item) => item.id === reviewedDraft.id ? reviewedDraft : item) } : current);
+    }
+    setOperationIssue({
+      title: request?.title || "Final review needs your decision",
+      message: request?.problems?.[0] || request?.message || "The final reviewer could not approve the automatic timeline.",
+      action: request?.action || "Review the proposed periods, trim or reject weak parts, then generate again.",
+      recoverable: true
+    });
+    if (items.length) {
+      setHighlightReview(makeHighlightReviewSession(items));
+      setHighlightTrim({ start: items[0].start, end: items[0].end });
+      navigateToReviewPage();
+      setNotice("Final review paused generation. Edit or confirm the proposed periods, then generate again.");
+    } else {
+      navigateToDashboard();
+      setNotice("Final review paused generation. Choose stronger clips or run Vision AI again before generating.");
+    }
+  }
+
+  async function createDraft(idea: VideoIdea, options: { ignoreMusicCoverage?: boolean } = {}) {
+    if (!project) return;
+    const generationSourceVideos = selectedVideoIds.length ? selectedVideos : project.files.filter(isSelectableSourceClip);
+    const generationVideoIds = generationSourceVideos
+      .filter((file) => semanticState(file) !== "rejected")
+      .map((file) => file.id);
+    if (!generationVideoIds.length) {
+      setNotice("No highlight-ready clips are available yet. Let Vision AI finish or choose stronger clips.");
+      return;
+    }
+    const notReady = generationSourceVideos.filter((file) =>
+      semanticState(file) !== "rejected" &&
+      (!file.metadata?.duration || file.metadata.videoCodec === "pending")
+    );
     if (notReady.length) {
       setNotice(`${notReady.length} selected video${notReady.length === 1 ? " is" : "s are"} still being analyzed. Wait until the folder progress finishes, then create the trailer.`);
       return;
     }
+    const readyGenerationVideos = generationSourceVideos.filter((file) => generationVideoIds.includes(file.id));
+    const clipDuration = totalSourceClipDuration(readyGenerationVideos);
+    const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
+    if (!options.ignoreMusicCoverage && selectedAudioAsset && musicDuration > 0 && clipDuration + 0.5 < musicDuration) {
+      setMusicCoveragePrompt({
+        idea,
+        clipDuration,
+        musicDuration,
+        musicName: selectedAudioAsset.name,
+        clipCount: readyGenerationVideos.length
+      });
+      setOperationIssue(null);
+      setNotice("The selected clips are shorter than the soundtrack. Add more clips before generating for a stronger edit.");
+      return;
+    }
+    setMusicCoveragePrompt(null);
+    setPendingHighlightGenerateIdea(null);
     setGenerating(true);
     setRenderJob(null);
     setOperationIssue(null);
@@ -918,7 +1541,7 @@ function App() {
         setNotice("Folder indexing paused while Vision AI prepares this video.");
       }
       let workingProject = project;
-      const needsTemporalVision = selectedVideos.filter((file) => {
+      const needsTemporalVision = generationSourceVideos.filter((file) => {
         const events = file.metadata?.semanticEvents || [];
         const verifiedEvents = events.filter((event) => event.payoffVerified === true);
         const needsFinePass = verifiedEvents.length === 0
@@ -958,32 +1581,40 @@ function App() {
           setGenerationAdvice("Generation will continue with saved analysis. For better clip timing, start Ollama and let Vision AI finish reviewing this folder.");
         }
       }
-      const reviewedSelected = workingProject.files.filter((file) => selectedVideoIds.includes(file.id));
-      const usableEvents = reviewedSelected.reduce((sum, file) =>
+      const reviewedGenerationSource = selectedVideoIds.length
+        ? workingProject.files.filter((file) => selectedVideoIds.includes(file.id))
+        : workingProject.files.filter(isSelectableSourceClip);
+      const usableEvents = reviewedGenerationSource.reduce((sum, file) =>
         sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
-      const indexedCandidates = reviewedSelected.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
+      const indexedCandidates = reviewedGenerationSource.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
       if (usableEvents < 3) {
-        setGenerationAdvice(`AI verified ${usableEvents} complete highlight event${usableEvents === 1 ? "" : "s"} in this selection. Generation will still continue using ${indexedCandidates} indexed candidate moment${indexedCandidates === 1 ? "" : "s"}. For a stronger result, add more clips with visible action payoffs or use AI picks for variety.`);
+        const uncertainCandidates = reviewedGenerationSource.reduce((sum, file) => sum + (file.metadata?.semanticCandidateHistory || []).length, 0);
+        setGenerationAdvice(`AI verified ${usableEvents} complete highlight event${usableEvents === 1 ? "" : "s"} in the generation pool. Generation will auto-rank ${uncertainCandidates} AI uncertain candidate${uncertainCandidates === 1 ? "" : "s"} and ${indexedCandidates} indexed moment${indexedCandidates === 1 ? "" : "s"} instead of blocking for manual review.`);
       }
       const primary = await generateDraft(
         workingProject.id,
         {
           ...idea,
           durationMode: "auto",
-          fileIds: selectedVideoIds,
+          fileIds: generationVideoIds,
           music: selectedAudioAsset?.name || "Game audio only"
         } as VideoIdea,
-        84
+        84,
+        highlightSessionDiscards.map((item) => ({
+          fileId: item.fileId,
+          start: item.start,
+          duration: item.duration
+        }))
       );
       const nextDrafts = [...drafts, primary];
       setDrafts(nextDrafts);
       setProject((current) => current ? { ...current, drafts: [...current.drafts, primary] } : current);
       setActiveDraft(nextDrafts.length - 1);
       setStage("drafts");
-      setNotice("Video generation started. You can continue using the app while it renders.");
-      const resumeAfterRender = pausedFastIndexId;
-      pausedFastIndexId = "";
-      void renderSpecificDraft(primary, resumeAfterRender);
+      beginDraftSegmentReview(primary, {
+        ...workingProject,
+        drafts: [...(workingProject.drafts || []), primary]
+      }, "AI planned the edit. Review each part, trim weak edges, reject bad cuts, then generate.");
     } catch (error) {
       const issue = issueFromError(error);
       setOperationIssue(issue);
@@ -1014,7 +1645,7 @@ function App() {
       setNotice(`Applied "${instruction}". Rendering the revised version in the background.`);
       void renderSpecificDraft(updated);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not update the draft.");
+      setNotice(noticeFromError(error, "Could not update the draft."));
     } finally {
       setBusy("");
     }
@@ -1045,7 +1676,11 @@ function App() {
         cancelRender.current = () => {
           void cancelRenderJob(job.id).then(setRenderJob).catch(() => undefined);
         };
-      });
+      }, musicRepeats);
+      if ("needsReview" in result) {
+        beginFinalReviewDecision(result.job, result.draft);
+        return;
+      }
       setDrafts((current) => current.map((item) => item.id === result.draft.id ? result.draft : item));
       setProject((current) => current ? { ...current, drafts: current.drafts.map((item) => item.id === result.draft.id ? result.draft : item) } : current);
       setNotice("Export complete. Your MP4 is ready.");
@@ -1076,7 +1711,7 @@ function App() {
         ? `AI review team approved this draft at ${result.review.averageScore}/100.`
         : `AI review team scored this draft ${result.review?.averageScore ?? 0}/100. Use the revision plan before final export.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not run the AI review team.");
+      setNotice(noticeFromError(error, "Could not run the AI review team."));
       setSettingsOpen(true);
     } finally {
       setBusy("");
@@ -1094,7 +1729,7 @@ function App() {
       setDrafts((current) => current.map((item, index) => index === activeDraft ? updated : item));
       setNotice(`${style} style applied. Render again to create the updated MP4.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not change style.");
+      setNotice(noticeFromError(error, "Could not change style."));
     } finally {
       setBusy("");
     }
@@ -1107,7 +1742,7 @@ function App() {
       setAdvancedAdvice(await requestAdvancedAdvice(project.id, textAiConfig, prompt || "Give general advice and recommend the best highlight style."));
       setPrompt("");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not get advanced AI advice.");
+      setNotice(noticeFromError(error, "Could not get advanced AI advice."));
       setSettingsOpen(true);
     } finally {
       setBusy("");
@@ -1126,7 +1761,7 @@ function App() {
       setAnalysis(result.project.analysis || analysis);
       setNotice(`AI reviewed ${result.reviewed} candidate frames and approved ${result.approved}.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Could not run vision review.");
+      setNotice(noticeFromError(error, "Could not run vision review."));
       setSettingsOpen(true);
     } finally {
       setBusy("");
@@ -1365,15 +2000,19 @@ function App() {
         setPreprocessJob,
         (cancel) => { cancelPreprocess.current = cancel; }
       );
-      if (job.result?.project) {
-        setProject(job.result.project);
-        setRecordings(job.result.project.files.map((file) => ({ ...file, type: "video", source: "recording" })));
-        setAnalysis(job.result.project.analysis || analysis);
-        setSelectedVideoIds(suggestVideoSelection(job.result.project.files));
+      const reviewedProject = job.result?.project;
+      if (reviewedProject) {
+        setProject(reviewedProject);
+        setRecordings(reviewedProject.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+        setAnalysis(reviewedProject.analysis || analysis);
+        setSelectedVideoIds((current) => current.filter((id) => {
+          const file = reviewedProject.files.find((item) => item.id === id);
+          return file && isSelectableSourceClip(file);
+        }));
       }
       setNotice(`AI preprocessing complete. Found ${job.eventsFound} usable action event${job.eventsFound === 1 ? "" : "s"}.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "AI preprocessing stopped.");
+      setNotice(noticeFromError(error, "AI preprocessing stopped."));
     }
   }
 
@@ -1387,15 +2026,19 @@ function App() {
         setFastIndexJob,
         (cancel) => { cancelFastIndex.current = cancel; }
       );
-      if (job.result?.project) {
-        setProject(job.result.project);
-        setRecordings(job.result.project.files.map((file) => ({ ...file, type: "video", source: "recording" })));
-        setAnalysis(job.result.project.analysis || analysis);
-        setSelectedVideoIds(suggestVideoSelection(job.result.project.files));
+      const indexedProject = job.result?.project;
+      if (indexedProject) {
+        setProject(indexedProject);
+        setRecordings(indexedProject.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+        setAnalysis(indexedProject.analysis || analysis);
+        setSelectedVideoIds((current) => current.filter((id) => {
+          const file = indexedProject.files.find((item) => item.id === id);
+          return file && isSelectableSourceClip(file);
+        }));
       }
       setNotice(`Fast index complete. Stored ${job.candidateWindows} reusable candidate windows.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Fast index stopped.");
+      setNotice(noticeFromError(error, "Fast index stopped."));
     }
   }
 
@@ -1417,7 +2060,7 @@ function App() {
       setNotice(next.status === "paused" ? "Fast index paused. Completed files are saved." : "Fast index resumed.");
     } catch (error) {
       setFastIndexJob(previous);
-      setNotice(error instanceof Error ? error.message : "Could not change the fast index state.");
+      setNotice(noticeFromError(error, "Could not change the fast index state."));
     } finally {
       setPausePending((current) => ({ ...current, "fast-index": false }));
     }
@@ -1429,19 +2072,15 @@ function App() {
       setNotice("Generated exports are shown for visibility, but they are not selectable as source footage.");
       return;
     }
+    if (file && semanticState(file) === "rejected") {
+      setNotice("This clip was rejected as low-signal footage and will not be used for generation.");
+      return;
+    }
     setGenerationAdvice("");
     setSelectedVideoIds((current) => {
       if (current.includes(id)) return current.filter((item) => item !== id);
       return [...current, id];
     });
-  }
-
-  function applySuggestedSelection() {
-    if (!project) return;
-    const next = suggestVideoSelection(project.files);
-    setGenerationAdvice("");
-    setSelectedVideoIds(next);
-    setNotice(`Selected ${next.length} recommended videos for the next trailer.`);
   }
 
   function selectDiversifiedClips() {
@@ -1455,7 +2094,7 @@ function App() {
 
   function selectFirstTwentyClips() {
     const eligible = visibleLibrary
-      .filter((file) => !looksLikeGeneratedExport(file.name) && file.metadata?.duration && file.metadata.videoCodec !== "pending")
+      .filter(isSelectableSourceClip)
       .slice(0, 20)
       .map((file) => file.id);
     setGenerationAdvice("");
@@ -1465,7 +2104,7 @@ function App() {
 
   function selectVisibleClips() {
     const next = visibleLibrary
-      .filter((file) => !looksLikeGeneratedExport(file.name) && file.metadata?.duration && file.metadata.videoCodec !== "pending")
+      .filter(isSelectableSourceClip)
       .map((file) => file.id);
     setGenerationAdvice("");
     setSelectedVideoIds(next);
@@ -1475,7 +2114,433 @@ function App() {
   function clearSelection() {
     setGenerationAdvice("");
     setSelectedVideoIds([]);
+    setHighlightSessionDiscards([]);
     setNotice("Clip selection cleared.");
+  }
+
+  function startHighlightReview() {
+    const items = reviewHighlightMoments;
+    if (!items.length) {
+      if (reviewConfirmedHighlightParts.length) {
+        setHighlightReview(makeHighlightReviewSession([], { total: 0, reviewed: 0, confirmed: reviewConfirmedHighlightParts.length }));
+        setHighlightTrim(null);
+        navigateToReviewPage();
+        setNotice("All saved highlight parts are already confirmed. Use Reconfirm only if you need to change one.");
+        return;
+      }
+      setNotice("No AI uncertain or potential highlight periods are available for review yet.");
+      return;
+    }
+    beginHighlightReview(
+      items,
+      aiUncertainReviewMoments.length
+        ? `Optional review: checking the top ${items.length} low-confidence AI pick${items.length === 1 ? "" : "s"}. Generation can continue without this.`
+        : `Optional review: checking ${items.length} highlight moment${items.length === 1 ? "" : "s"}. Trim only the parts you want to improve.`
+    );
+  }
+
+  function addMoreHighlightCandidates() {
+    const existing = highlightReview?.items || [];
+    const savedVerifiedItems = reviewingPlannedDraft
+      ? rankedLibrary
+        .flatMap((file) => (file.metadata?.confirmedHighlightMoments || []).map((moment) => confirmedMomentToReviewItem(file, moment)))
+        .filter((item) => !isDuplicateReviewItem(item, existing))
+      : [];
+    const candidatePool = reviewingPlannedDraft
+      ? optionalReviewItems(rankedLibrary, 40)
+      : reviewHighlightMoments;
+    const pendingItems = candidatePool.filter((item) =>
+      !isDuplicateReviewItem(item, existing) &&
+      !savedVerifiedItems.some((candidate) => candidate.file.id === item.file.id)
+    );
+    const additions = [...savedVerifiedItems, ...pendingItems].slice(0, 10);
+    if (!additions.length) {
+      setNotice("There are no more unique highlight parts to add. Choose more footage or use a shorter soundtrack.");
+      return;
+    }
+    if (!highlightReview) {
+      beginHighlightReview(additions, `Added ${additions.length} more highlight part${additions.length === 1 ? "" : "s"} to review.`);
+      return;
+    }
+    const nextItems = [...existing, ...additions];
+    const firstPendingAddition = additions.find((item) => !item.confirmed) || additions[0];
+    const nextIndex = Math.max(0, nextItems.findIndex((item) => item.id === firstPendingAddition.id));
+    setHighlightReview(makeHighlightReviewSession(nextItems, {
+      index: nextIndex,
+      total: highlightReview.total + additions.length
+    }));
+    setHighlightTrim(firstPendingAddition ? { start: firstPendingAddition.start, end: firstPendingAddition.end } : null);
+    setReviewMusicCoveragePrompt(null);
+    setReviewGeneratePrompt(false);
+    setReviewGeneratePromptDismissed(false);
+    setNotice(`Added ${additions.length} more unique highlight part${additions.length === 1 ? "" : "s"} without removing your approved picks.`);
+  }
+
+  function moveHighlightReview(delta: number) {
+    setHighlightReview((current) => {
+      if (!current) return current;
+      const index = Math.max(0, Math.min(current.items.length - 1, current.index + delta));
+      return { ...current, index };
+    });
+  }
+
+  function updateHighlightTrim(part: "start" | "end", value: number) {
+    const item = highlightReview?.items[highlightReview.index];
+    if (!item) return;
+    if (highlightReviewFrame.current !== null) {
+      window.cancelAnimationFrame(highlightReviewFrame.current);
+      highlightReviewFrame.current = null;
+    }
+    setHighlightReviewPlaying(false);
+    setHighlightTrim((current) => {
+      const base = current || { start: item.start, end: item.end };
+      const minGap = 1;
+      const duration = Math.max(minGap, Number(item.file.metadata?.duration || item.end || minGap));
+      const next = { ...base, [part]: value };
+      next.start = Math.max(0, Math.min(next.start, duration - minGap));
+      next.end = Math.max(minGap, Math.min(next.end, duration));
+      if (next.end - next.start < minGap) {
+        if (part === "start") {
+          next.end = Math.min(duration, next.start + minGap);
+          if (next.end - next.start < minGap) next.start = Math.max(0, next.end - minGap);
+        } else {
+          next.start = Math.max(0, next.end - minGap);
+        }
+      }
+      const video = highlightReviewVideo.current;
+      if (video) {
+        if (!video.paused) video.pause();
+        video.currentTime = part === "start" ? next.start : next.end;
+      }
+      return {
+        start: Math.round(next.start * 10) / 10,
+        end: Math.round(next.end * 10) / 10
+      };
+    });
+  }
+
+  function clearHighlightPlaybackGuard() {
+    if (highlightReviewFrame.current === null) return;
+    window.cancelAnimationFrame(highlightReviewFrame.current);
+    highlightReviewFrame.current = null;
+  }
+
+  function pauseHighlightAtPeriodEnd(end: number) {
+    const video = highlightReviewVideo.current;
+    clearHighlightPlaybackGuard();
+    if (video) {
+      video.pause();
+      video.currentTime = end;
+    }
+    setHighlightReviewPlaying(false);
+  }
+
+  function guardHighlightPlaybackEnd(end: number) {
+    clearHighlightPlaybackGuard();
+    const tick = () => {
+      const video = highlightReviewVideo.current;
+      if (!video || video.paused || video.ended) {
+        highlightReviewFrame.current = null;
+        setHighlightReviewPlaying(false);
+        return;
+      }
+      if (video.currentTime >= end - 0.04) {
+        pauseHighlightAtPeriodEnd(end);
+        return;
+      }
+      highlightReviewFrame.current = window.requestAnimationFrame(tick);
+    };
+    highlightReviewFrame.current = window.requestAnimationFrame(tick);
+  }
+
+  function playHighlightReview() {
+    const item = highlightReview?.items[highlightReview.index];
+    const trim = highlightTrim || (item ? { start: item.start, end: item.end } : null);
+    const video = highlightReviewVideo.current;
+    if (!item || !trim || !video) return;
+    video.currentTime = trim.start;
+    setHighlightReviewPlaying(true);
+    void video.play()
+      .then(() => guardHighlightPlaybackEnd(trim.end))
+      .catch(() => setHighlightReviewPlaying(false));
+  }
+
+  function stopHighlightReview() {
+    const item = highlightReview?.items[highlightReview.index];
+    const trim = highlightTrim || (item ? { start: item.start, end: item.end } : null);
+    const video = highlightReviewVideo.current;
+    if (!video || !trim) return;
+    clearHighlightPlaybackGuard();
+    video.pause();
+    video.currentTime = trim.start;
+    setHighlightReviewPlaying(false);
+  }
+
+  function handleHighlightReviewTime() {
+    const item = highlightReview?.items[highlightReview.index];
+    const trim = highlightTrim || (item ? { start: item.start, end: item.end } : null);
+    const video = highlightReviewVideo.current;
+    if (!video || !trim) return;
+    if (video.currentTime >= trim.end) {
+      pauseHighlightAtPeriodEnd(trim.end);
+    }
+  }
+
+  async function confirmCurrentHighlight() {
+    if (!project || !highlightReview) return;
+    const item = highlightReview.items[highlightReview.index];
+    const trim = highlightTrim || { start: item.start, end: item.end };
+    try {
+      const next = await confirmHighlightMoment(project.id, item.file.id, {
+        start: trim.start,
+        end: trim.end,
+        score: item.score,
+        state: item.state,
+        action: item.action,
+        storyRole: item.storyRole,
+        source: item.source,
+        replaceStart: item.start,
+        replaceEnd: item.end
+      });
+      setProject(next);
+      setRecordings(next.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+      setRecentProjects((current) => current.map((candidate) => candidate.id === next.id ? next : candidate));
+      setHighlightReview((current) => {
+        if (!current) return current;
+        const items = current.items.map((candidate, index) => index === current.index ? {
+          ...candidate,
+          start: trim.start,
+          end: trim.end,
+          duration: trim.end - trim.start,
+          confirmed: true,
+          reviewed: true
+        } : candidate);
+        const wasReviewed = Boolean(current.items[current.index]?.reviewed);
+        const wasConfirmed = Boolean(current.items[current.index]?.confirmed);
+        return makeHighlightReviewSession(items, {
+          index: Math.min(current.index + 1, items.length - 1),
+          total: current.total,
+          reviewed: current.reviewed + (wasReviewed ? 0 : 1),
+          confirmed: current.confirmed + (wasConfirmed ? 0 : 1)
+        });
+      });
+      setNotice("Confirmed highlight period saved. Future generation will prioritize it.");
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
+  }
+
+  function reconfirmHighlightPart(file: MediaAsset, moment: ConfirmedHighlightMoment) {
+    const duration = Number(file.metadata?.duration || moment.end || 0);
+    const start = Math.max(0, Math.min(duration, Number(moment.start) || 0));
+    const end = Math.max(start + 1, Math.min(duration, Number(moment.end) || start + Number(moment.duration || 0) || start + 1));
+    const item: HighlightReviewItem = {
+      id: `${file.id}:reconfirm:${Math.round(start * 10)}:${Math.round(end * 10)}`,
+      file,
+      start,
+      end,
+      duration: end - start,
+      score: Math.round(Number(moment.score) || Number(file.metadata?.semanticScore) || Number(file.metadata?.indexScore) || 75),
+      state: moment.state || "human-confirmed",
+      action: moment.action || "confirmed highlight",
+      storyRole: moment.storyRole || "payoff",
+      source: moment.source || "human-confirmed",
+      label: "Reconfirm picked part",
+      confidence: "high",
+      confirmed: true
+    };
+    setHighlightReview(makeHighlightReviewSession([item], { confirmed: 1 }));
+    setHighlightTrim({ start, end });
+    navigateToReviewPage();
+    setNotice("Adjust the picked highlight part, then confirm again to update the saved time.");
+  }
+
+  function viewConfirmedHighlightPart(file: MediaAsset, moment: ConfirmedHighlightMoment) {
+    reconfirmHighlightPart(file, moment);
+    setNotice("Previewing the saved highlight period. Use Reconfirm only if you need to change it.");
+  }
+
+  function viewHighlightReviewCandidate(item: HighlightReviewItem) {
+    setHighlightReview((current) => {
+      const existingIndex = current?.items.findIndex((candidate) => candidate.id === item.id) ?? -1;
+      if (current && existingIndex >= 0) {
+        return { ...current, index: existingIndex };
+      }
+      return makeHighlightReviewSession([item], { total: current?.total || 1 });
+    });
+    setHighlightTrim({ start: item.start, end: item.end });
+    navigateToReviewPage();
+    setNotice("Review this AI uncertain period, adjust it if needed, then agree or reject it.");
+  }
+
+  async function removeConfirmedHighlightPart(file: MediaAsset, moment: ConfirmedHighlightMoment) {
+    if (!project) return;
+    try {
+      const next = await removeHighlightConfirmation(project.id, file.id, {
+        start: moment.start,
+        end: moment.end
+      });
+      setProject(next);
+      setRecordings(next.files.map((item) => ({ ...item, type: "video", source: "recording" })));
+      setRecentProjects((current) => current.map((candidate) => candidate.id === next.id ? next : candidate));
+      setNotice("Removed the confirmed highlight period. It can still appear as a candidate unless you mark it not a highlight.");
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
+  }
+
+  function advanceOrCloseHighlightReview(items: HighlightReviewItem[], currentIndex: number, progress: { reviewed?: number; confirmed?: number } = {}) {
+    if (!items.length) {
+      setHighlightReview((current) => makeHighlightReviewSession([], {
+        total: current?.total || 0,
+        reviewed: progress.reviewed ?? current?.reviewed ?? 0,
+        confirmed: progress.confirmed ?? current?.confirmed ?? 0
+      }));
+      setHighlightTrim(null);
+      setHighlightReviewPlaying(false);
+      return;
+    }
+    setHighlightReview((current) => makeHighlightReviewSession(items, {
+      index: Math.min(currentIndex, items.length - 1),
+      total: current?.total || items.length,
+      reviewed: progress.reviewed ?? current?.reviewed ?? 0,
+      confirmed: progress.confirmed ?? current?.confirmed ?? 0
+    }));
+  }
+
+  async function generateFromHighlightReview(options: { ignoreMusicCoverage?: boolean } = {}) {
+    if (pendingReviewDraftId) {
+      if (!project || !highlightReview) return;
+      const draft = drafts.find((item) => item.id === pendingReviewDraftId) || project.drafts.find((item) => item.id === pendingReviewDraftId);
+      if (!draft) {
+        setNotice("The planned draft could not be found. Create the draft again.");
+        return;
+      }
+      const segments = confirmedReviewItemsToSegments(highlightReview);
+      if (!segments.length) {
+        setNotice("Agree to at least one planned part before generating. Rejected and skipped parts will not be used.");
+        return;
+      }
+      const duration = totalSegmentDuration(segments);
+      const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
+      if (!options.ignoreMusicCoverage && selectedAudioAsset && musicDuration > 0 && duration + 0.5 < musicDuration) {
+        setReviewGeneratePrompt(false);
+        setReviewGeneratePromptDismissed(false);
+        setReviewMusicCoveragePrompt({
+          clipDuration: duration,
+          musicDuration,
+          musicName: selectedAudioAsset.name,
+          clipCount: new Set(segments.map((segment) => segment.fileId)).size
+        });
+        setNotice("The reviewed highlight parts are shorter than the soundtrack. Add more parts before generating for a stronger edit.");
+        return;
+      }
+      setReviewMusicCoveragePrompt(null);
+      try {
+        setReviewGeneratePrompt(false);
+        setReviewGeneratePromptDismissed(false);
+        setGenerating(true);
+        setRenderJob(null);
+        setOperationIssue(null);
+        const updated = await updateDraft(project.id, draft.id, {
+          segments,
+          duration,
+          status: "ready",
+          reviewedFileIds: [...new Set([...(draft.fileIds || []), ...highlightReview.items.map((item) => item.file.id)])],
+          changes: [...(draft.changes || []), "User reviewed and approved planned cuts before rendering"]
+        } as Partial<Draft> & { reviewedFileIds: string[] });
+        setDrafts((current) => current.map((item) => item.id === updated.id ? updated : item));
+        const reviewedIds = new Set([...(draft.fileIds || []), ...highlightReview.items.map((item) => item.file.id)]);
+        setProject((current) => current ? {
+          ...current,
+          files: current.files.map((file) => reviewedIds.has(file.id) ? {
+            ...file,
+            metadata: file.metadata ? { ...file.metadata, reviewed: true, reviewedAt: file.metadata.reviewedAt || new Date().toISOString() } : file.metadata
+          } : file),
+          drafts: current.drafts.map((item) => item.id === updated.id ? updated : item)
+        } : current);
+        setActiveDraft(Math.max(0, drafts.findIndex((item) => item.id === updated.id)));
+        setHighlightReview(null);
+        setHighlightTrim(null);
+        setPendingReviewDraftId("");
+        setPendingHighlightGenerateIdea(null);
+        navigateToDashboard();
+        setNotice("Approved cuts saved. Rendering the reviewed video now.");
+        await renderSpecificDraft(updated);
+      } catch (error) {
+        const issue = issueFromError(error);
+        setOperationIssue(issue);
+        setNotice(`${issue.title}: ${issue.message}`);
+      } finally {
+        setGenerating(false);
+      }
+      return;
+    }
+    if (!recommendedIdea) return;
+    const idea = pendingHighlightGenerateIdea || recommendedIdea;
+    setHighlightReview(null);
+    setPendingHighlightGenerateIdea(null);
+    navigateToDashboard();
+    await createDraft(idea);
+  }
+
+  async function skipCurrentHighlightThisTime() {
+    if (!project || !highlightReview) return;
+    const item = highlightReview.items[highlightReview.index];
+    try {
+      const next = await markHighlightReviewed(project.id, item.file.id, true);
+      setProject(next);
+      setRecordings(next.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+      setRecentProjects((current) => current.map((candidate) => candidate.id === next.id ? next : candidate));
+      setHighlightSessionDiscards((current) => [
+        ...current,
+        {
+          fileId: item.file.id,
+          start: item.start,
+          end: item.end,
+          duration: item.end - item.start,
+          source: item.source,
+          reason: "skip-this-time"
+        }
+      ]);
+      const items = highlightReview.items.filter((candidate, index) => index !== highlightReview.index && candidate.file.id !== item.file.id);
+      advanceOrCloseHighlightReview(items, highlightReview.index, { reviewed: highlightReview.reviewed + (item.reviewed ? 0 : 1) });
+      setNotice("Marked this clip reviewed. It will not appear in future review queues.");
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
+  }
+
+  async function rejectCurrentHighlightAsNotHighlight() {
+    if (!project || !highlightReview) return;
+    const item = highlightReview.items[highlightReview.index];
+    try {
+      const next = await rejectHighlightMoment(project.id, item.file.id, {
+        start: item.start,
+        end: item.end,
+        source: item.source,
+        reason: "not-highlight"
+      });
+      setProject(next);
+      setRecordings(next.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+      setRecentProjects((current) => current.map((candidate) => candidate.id === next.id ? next : candidate));
+      const items = highlightReview.items.filter((candidate) =>
+        candidate.file.id !== item.file.id ||
+        Math.max(candidate.start, item.start) >= Math.min(candidate.end, item.end) - 0.75
+      );
+      advanceOrCloseHighlightReview(items, highlightReview.index, { reviewed: highlightReview.reviewed + (item.reviewed ? 0 : 1) });
+      setNotice("Marked as not a highlight. This period will not be shown or used again.");
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
   }
 
   function openMusicBrowser() {
@@ -1510,8 +2575,9 @@ function App() {
       setNotice(next.status === "paused" ? "Vision AI paused and the active Ollama request was stopped." : "Vision AI resumed.");
     } catch (error) {
       setPreprocessJob(previous);
-      setAutoAiStatus({ state: "error", message: error instanceof Error ? error.message : "Could not change the Vision AI state." });
-      setNotice(error instanceof Error ? error.message : "Could not change the Vision AI state.");
+      const message = noticeFromError(error, "Could not change the Vision AI state.");
+      setAutoAiStatus({ state: "error", message });
+      setNotice(message);
     } finally {
       setPausePending((current) => ({ ...current, vision: false }));
     }
@@ -1537,7 +2603,7 @@ function App() {
         : "Render resumed.");
     } catch (error) {
       setRenderJob(previous);
-      setNotice(error instanceof Error ? error.message : "Could not change the render state.");
+      setNotice(noticeFromError(error, "Could not change the render state."));
     } finally {
       setPausePending((current) => ({ ...current, render: false }));
     }
@@ -1566,6 +2632,7 @@ function App() {
   }
 
   function reset() {
+    navigateToDashboard();
     setStage("start");
     setRecordings([]);
     setProject(null);
@@ -1580,6 +2647,15 @@ function App() {
     setPreprocessJob(null);
     setSelectedVideoIds([]);
     setSelectedAudioAssetId("");
+    setMusicRepeats(1);
+    setHighlightReview(null);
+    setHighlightReviewPlaying(false);
+    setHighlightTrim(null);
+    setHighlightSessionDiscards([]);
+    setPendingHighlightGenerateIdea(null);
+    setPendingReviewDraftId("");
+    setReviewGeneratePrompt(false);
+    setReviewGeneratePromptDismissed(false);
     setVisionModelStatus(null);
     setTextModelStatus(null);
     setOperationIssue(null);
@@ -1617,11 +2693,15 @@ function App() {
     file.metadata.videoCodec !== "pending"
   ) || [];
   const folderVideoTotal = reviewableFolderVideos.length || preprocessJob?.totalProjectFiles || preprocessJob?.totalFiles || 0;
-  const semanticReadyFiles = reviewableFolderVideos.filter((file) => semanticState(file) === "verified").length;
-  const semanticUncertainFiles = reviewableFolderVideos.filter((file) => semanticState(file) === "uncertain").length;
+  const semanticReadyFiles = reviewableFolderVideos.filter((file) => semanticState(file) === "verified" || hasAutoUsableHighlightCandidate(file)).length;
+  const semanticRejectedFiles = reviewableFolderVideos.filter((file) => semanticState(file) === "rejected").length;
+  const semanticUncertainFiles = reviewableFolderVideos.filter((file) =>
+    semanticState(file) === "uncertain" &&
+    !hasAutoUsableHighlightCandidate(file)
+  ).length;
   const pendingVisionCheckFiles = reviewableFolderVideos.filter((file) => needsVisionRecheck(file)).length;
   const semanticReviewedFiles = reviewableFolderVideos.filter((file) =>
-    ["verified", "reviewed", "uncertain"].includes(semanticState(file)) && !needsVisionRecheck(file)
+    ["verified", "reviewed", "uncertain", "rejected"].includes(semanticState(file)) && !needsVisionRecheck(file)
   ).length;
   const activePreprocessTotal = preprocessJob?.totalFiles || preprocessJob?.totalProjectFiles || folderVideoTotal;
   const activePreprocessChecked = Math.min(activePreprocessTotal, preprocessJob?.processedFiles || 0);
@@ -1646,7 +2726,7 @@ function App() {
     : [];
   const clipDescription = (file: MediaAsset) => {
     const tags = usefulTags(file);
-    const bestTime = file.metadata?.semanticTopFrame ?? file.metadata?.highlightStart;
+    const bestTime = reliableFocusTime(file);
     const moments = potentialMomentSummary(file);
     const state = semanticState(file);
     if (state === "needs_check") return "Needs Vision AI check before it is ranked as verified.";
@@ -1681,6 +2761,7 @@ function App() {
         ? a.name.localeCompare(b.name)
         : (b.metadata?.indexScore || b.metadata?.semanticScore || b.metadata?.actionScore || 0) - (a.metadata?.indexScore || a.metadata?.semanticScore || a.metadata?.actionScore || 0));
   const visibleClipPage = visibleLibrary.slice(0, visibleClipLimit);
+  const hasMoreVisibleClips = visibleClipLimit < visibleLibrary.length;
   const generatedVideos = drafts.filter((draft) => draft.exportUrl);
   const audioAssets = localAssets.filter((asset) => asset.type === "audio");
   const selectedAudioAsset = audioAssets.find((asset) => asset.id === selectedAudioAssetId) || null;
@@ -1693,7 +2774,9 @@ function App() {
   ));
   const scoreLabel = (file: MediaAsset) => {
     const state = semanticState(file);
+    if (state === "rejected") return "AI rejected";
     if (state === "verified") return "AI verified";
+    if (state === "uncertain" && hasAutoUsableHighlightCandidate(file)) return "AI verified";
     if (state === "reviewed") return "AI checked";
     if (state === "uncertain") return "AI uncertain";
     if (state === "needs_check") return "Pending review";
@@ -1701,14 +2784,81 @@ function App() {
   };
   const availableIdeas = analysis?.ideas?.length ? analysis.ideas : curatedIdeas;
   const recommendedIdea = availableIdeas.find((idea) => idea.id === "trailer") || availableIdeas[0];
+  const generationSourceVideos = selectedVideoIds.length ? selectedVideos : rankedLibrary.filter(isSelectableSourceClip);
+  const generationSourceLabel = selectedVideoIds.length
+    ? `${selectedVideoIds.length} selected clip${selectedVideoIds.length === 1 ? "" : "s"}`
+    : `${generationSourceVideos.length} confirmed clip${generationSourceVideos.length === 1 ? "" : "s"}`;
   const readySelectedVideos = selectedVideos.filter((file) => file.metadata?.duration && file.metadata.videoCodec !== "pending");
   const selectedVerifiedMoments = selectedVideos.reduce((sum, file) =>
     sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
+  const selectedConfirmedMoments = selectedVideos.reduce((sum, file) => sum + (file.metadata?.confirmedHighlightMoments || []).length, 0);
+  const aiUncertainVideos = rankedLibrary.filter((file) =>
+    isVisionReviewableSource(file) &&
+    semanticState(file) === "uncertain" &&
+    !hasAutoUsableHighlightCandidate(file)
+  );
+  const aiUncertainReviewMoments = optionalReviewItems(aiUncertainVideos);
+  const selectedReviewMoments = optionalReviewItems(selectedVideos);
+  const allReviewMoments = optionalReviewItems(rankedLibrary);
+  const selectedConfirmedHighlightParts = selectedVideos.flatMap((file) =>
+    (file.metadata?.confirmedHighlightMoments || []).map((moment) => ({
+      file,
+      moment,
+      id: `${file.id}:${Math.round(moment.start * 10)}:${Math.round(moment.end * 10)}`
+    }))
+  );
+  const allConfirmedHighlightParts = rankedLibrary.flatMap((file) =>
+    (file.metadata?.confirmedHighlightMoments || []).map((moment) => ({
+      file,
+      moment,
+      id: `${file.id}:${Math.round(moment.start * 10)}:${Math.round(moment.end * 10)}`
+    }))
+  );
+  const reviewConfirmedHighlightParts = aiUncertainVideos.length || !selectedVideoIds.length ? allConfirmedHighlightParts : selectedConfirmedHighlightParts;
+  const reviewHighlightMoments = aiUncertainReviewMoments.length
+    ? aiUncertainReviewMoments
+    : selectedReviewMoments.length
+      ? selectedReviewMoments
+      : allReviewMoments;
+  const reviewingPlannedDraft = Boolean(pendingReviewDraftId);
+  const activeReviewQueueParts: HighlightSidebarPart[] = (highlightReview?.items || reviewHighlightMoments).map((item) => ({
+    id: item.id,
+    file: item.file,
+    start: item.start,
+    end: item.end,
+    action: item.action,
+    source: item.source,
+    status: item.confirmed ? "confirmed" : "pending",
+    confidence: item.confidence,
+    item
+  }));
+  const reviewSidebarParts = [...activeReviewQueueParts];
+  if (!reviewingPlannedDraft) {
+    for (const { file, moment, id } of reviewConfirmedHighlightParts) {
+      const start = Number(moment.start) || 0;
+      const end = Number(moment.end) || start + (Number(moment.duration) || 0);
+      if (reviewSidebarParts.some((part) => part.file.id === file.id && intervalsOverlapMeaningfully(part, { start, end }))) continue;
+      reviewSidebarParts.push({
+        id: `confirmed:${id}`,
+        file,
+        start,
+        end,
+        action: moment.action,
+        source: moment.source,
+        status: "confirmed",
+        confidence: "high",
+        moment
+      });
+    }
+  }
+  const pendingReviewSidebarCount = reviewSidebarParts.filter((part) => part.status === "pending").length;
   const selectedWeakOrStale = selectedVideos.filter((file) => ["needs_check", "reviewed", "uncertain"].includes(semanticState(file))).length;
   const selectedIndexedCandidates = selectedVideos.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
-  const selectionReady = selectedVideoIds.length > 0 && readySelectedVideos.length === selectedVideoIds.length;
+  const selectionReady = selectedVideoIds.length
+    ? readySelectedVideos.length === selectedVideoIds.length
+    : generationSourceVideos.length > 0;
   const generationReady = selectionReady;
-  const renderActive = Boolean(renderJob && !["completed", "failed", "cancelled"].includes(renderJob.status));
+  const renderActive = Boolean(renderJob && !["completed", "needs_review", "failed", "cancelled"].includes(renderJob.status));
   const selectedDraft = drafts[activeDraft] || drafts[drafts.length - 1] || null;
   const latestExportedDraft = [...drafts].reverse().find((draft) => draft.exportUrl) || null;
   const currentDraft = generating || renderActive ? selectedDraft : selectedDraft?.exportUrl ? selectedDraft : latestExportedDraft || selectedDraft;
@@ -1761,6 +2911,217 @@ function App() {
   const currentVisionProfile = effectiveVisionProfile(visionReviewMode, aiResourceLimits, visionAiConfig.endpoint);
   const localOllamaWorkerCap = isLocalOllamaVisionEndpoint(visionAiConfig.endpoint);
   const visionResourceSummary = `${currentVisionProfile.concurrency} worker${currentVisionProfile.concurrency === 1 ? "" : "s"}, ${currentVisionProfile.framesPerClip} frames/video${aiResourceLimits.maxVideosPerRun > 0 ? `, ${aiResourceLimits.maxVideosPerRun} videos/run` : ", all pending videos"}`;
+  const activeHighlightReviewItem = (highlightReview?.items[highlightReview.index] || null) as HighlightReviewItem;
+  const activeHighlightTrim = (activeHighlightReviewItem
+    ? highlightTrim || { start: activeHighlightReviewItem.start, end: activeHighlightReviewItem.end }
+    : null) as { start: number; end: number };
+  const activeHighlightDuration = activeHighlightReviewItem?.file.metadata?.duration || activeHighlightReviewItem?.end || 1;
+  const activeTrimStartPercent = activeHighlightTrim ? Math.max(0, Math.min(100, (activeHighlightTrim.start / Math.max(1, activeHighlightDuration)) * 100)) : 0;
+  const activeTrimEndPercent = activeHighlightTrim ? Math.max(activeTrimStartPercent, Math.min(100, (activeHighlightTrim.end / Math.max(1, activeHighlightDuration)) * 100)) : 0;
+  const reviewGenerationReady = reviewingPlannedDraft
+    ? Boolean(highlightReview?.confirmed)
+    : Boolean(recommendedIdea && generationReady);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 3300);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!pendingReviewDraftId || !highlightReview || reviewGeneratePrompt || reviewGeneratePromptDismissed || generating || renderActive) return;
+    const reviewComplete = highlightReview.total > 0 && highlightReview.reviewed >= highlightReview.total;
+    const queueExhausted = highlightReview.items.length === 0;
+    if ((reviewComplete || queueExhausted) && highlightReview.confirmed > 0) {
+      const segments = confirmedReviewItemsToSegments(highlightReview);
+      const duration = totalSegmentDuration(segments);
+      const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
+      if (selectedAudioAsset && musicDuration > 0 && duration + 0.5 < musicDuration) {
+        setReviewMusicCoveragePrompt({
+          clipDuration: duration,
+          musicDuration,
+          musicName: selectedAudioAsset.name,
+          clipCount: new Set(segments.map((segment) => segment.fileId)).size
+        });
+        setReviewGeneratePrompt(false);
+        setNotice("The reviewed highlight parts are shorter than the soundtrack. Add more parts before generating for a stronger edit.");
+        return;
+      }
+      setReviewMusicCoveragePrompt(null);
+      setReviewGeneratePrompt(true);
+      setNotice("All planned parts are reviewed. Confirm generation to start rendering.");
+    }
+  }, [
+    pendingReviewDraftId,
+    highlightReview?.reviewed,
+    highlightReview?.confirmed,
+    highlightReview?.total,
+    highlightReview?.items.length,
+    reviewGeneratePrompt,
+    reviewGeneratePromptDismissed,
+    generating,
+    renderActive,
+    selectedAudioAssetId,
+    selectedAudioAsset?.duration,
+    selectedAudioAsset?.metadata?.duration,
+    musicRepeats
+  ]);
+
+  function renderReviewMusicCoveragePrompt() {
+    const prompt = reviewMusicCoveragePrompt;
+    if (!prompt) return null;
+    return (
+      <section className="music-coverage-card review-music-coverage" role="alert" aria-label="Add more reviewed parts for selected music">
+        <div><Music2 size={17} /><strong>Add more highlight parts</strong></div>
+        <p>
+          {prompt.clipCount} approved clip{prompt.clipCount === 1 ? "" : "s"} total {formatTime(prompt.clipDuration)}, but {prompt.musicName} needs {formatTime(prompt.musicDuration)}.
+        </p>
+        <div>
+          <button onClick={() => {
+            setReviewMusicCoveragePrompt(null);
+            addMoreHighlightCandidates();
+          }}><Plus size={15} /> Add more parts</button>
+          <button onClick={() => {
+            setReviewMusicCoveragePrompt(null);
+            void generateFromHighlightReview({ ignoreMusicCoverage: true });
+          }}>Generate anyway</button>
+        </div>
+      </section>
+    );
+  }
+
+  function renderHighlightReviewPage() {
+    const reviewedCount = highlightReview ? Math.min(highlightReview.total, highlightReview.reviewed) : 0;
+    return (
+      <main className="highlight-review-page">
+        <header className="review-page-heading">
+          <button className="back-button" onClick={navigateToDashboard}><ArrowLeft size={18} /></button>
+          <div>
+            <span className="panel-label">{reviewingPlannedDraft ? "Generation review" : "Review page"}</span>
+            <h2>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : reviewingPlannedDraft ? "Review planned video parts" : "Highlight review"}</h2>
+            <p>{highlightReview
+              ? `${reviewedCount} of ${highlightReview.total} reviewed · ${highlightReview.confirmed} agreed${activeHighlightReviewItem ? ` · Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
+              : "Choose clips first, then start highlight review."}</p>
+          </div>
+        </header>
+
+        <div className="highlight-review-workspace">
+          <section className="highlight-review-stage">
+            {activeHighlightReviewItem && activeHighlightTrim ? (
+              <>
+                <video
+                  ref={highlightReviewVideo}
+                  src={sourceVideoUrl(activeHighlightReviewItem.file)}
+                  controls
+                  preload="metadata"
+                  onTimeUpdate={handleHighlightReviewTime}
+                  onPause={() => {
+                    clearHighlightPlaybackGuard();
+                    setHighlightReviewPlaying(false);
+                  }}
+                  onEnded={() => {
+                    clearHighlightPlaybackGuard();
+                    setHighlightReviewPlaying(false);
+                  }}
+                />
+                <div className="highlight-trim-box" aria-label="Video cut controls">
+                  <div
+                    className="highlight-trim-rail"
+                    style={{
+                      "--start": `${activeTrimStartPercent}%`,
+                      "--end": `${activeTrimEndPercent}%`
+                    } as React.CSSProperties}
+                  >
+                    <div className="trim-label trim-label-start"><span>Start</span><strong>{formatTime(activeHighlightTrim.start)}</strong></div>
+                    <div className="trim-label trim-label-end"><span>End</span><strong>{formatTime(activeHighlightTrim.end)}</strong></div>
+                    <div className="trim-track"><span /></div>
+                    <input
+                      className="trim-range trim-range-start"
+                      aria-label="Trim start"
+                      type="range"
+                      min={0}
+                      max={Math.max(0, activeHighlightDuration - 1)}
+                      step="0.1"
+                      value={activeHighlightTrim.start}
+                      onChange={(event) => updateHighlightTrim("start", Number(event.target.value))}
+                    />
+                    <input
+                      className="trim-range trim-range-end"
+                      aria-label="Trim end"
+                      type="range"
+                      min={1}
+                      max={activeHighlightDuration}
+                      step="0.1"
+                      value={activeHighlightTrim.end}
+                      onChange={(event) => updateHighlightTrim("end", Number(event.target.value))}
+                    />
+                  </div>
+                  <small>Drag the start and end markers above the timeline, then play the period before confirming.</small>
+                </div>
+                <footer className="highlight-review-controls">
+                  <button disabled={!highlightReview || highlightReview.index === 0} onClick={() => moveHighlightReview(-1)}><ArrowLeft size={16} /> Previous</button>
+                  <button onClick={highlightReviewPlaying ? stopHighlightReview : playHighlightReview}>
+                    {highlightReviewPlaying ? <Square size={16} /> : <Play size={16} fill="currentColor" />}
+                    {highlightReviewPlaying ? "Stop" : "Play period"}
+                  </button>
+                  <button disabled={!highlightReview || highlightReview.index >= highlightReview.items.length - 1} onClick={() => moveHighlightReview(1)}>Next <ArrowRight size={16} /></button>
+                  <button onClick={() => void skipCurrentHighlightThisTime()}><X size={16} /> Skip this time</button>
+                  <button className="reject-highlight-button" onClick={() => void rejectCurrentHighlightAsNotHighlight()}><Trash2 size={16} /> Not a highlight</button>
+                  <button className="confirm-highlight-button" onClick={() => void confirmCurrentHighlight()}><Check size={16} /> {activeHighlightReviewItem.confirmed ? "Confirmed" : "Agree, use it"}</button>
+                </footer>
+              </>
+            ) : (
+              <div className="highlight-review-empty">
+                <Check size={24} />
+                <strong>{reviewConfirmedHighlightParts.length ? "Review complete" : "No active candidate"}</strong>
+                <span>{reviewConfirmedHighlightParts.length ? "Use the picked parts list, add more candidates, or generate the video." : "Go back to clips and start review again."}</span>
+              </div>
+            )}
+          </section>
+
+          <aside className="picked-highlight-panel">
+            <div>
+              <span className="panel-label">{reviewingPlannedDraft ? "Planned parts" : "Review queue"}</span>
+              <strong>{pendingReviewSidebarCount} to review · {reviewConfirmedHighlightParts.length} saved</strong>
+            </div>
+            <div className="picked-highlight-list">
+              {reviewSidebarParts.length ? reviewSidebarParts.map((part) => (
+                <article key={part.id} className={part.status === "confirmed" ? "confirmed" : "pending"}>
+                  <button className="picked-highlight-thumbnail" onClick={() => part.item ? viewHighlightReviewCandidate(part.item) : part.moment && viewConfirmedHighlightPart(part.file, part.moment)} aria-label={`Preview ${part.file.name.replace(/\.[^.]+$/, "")}`}>
+                    <img src={thumbnailUrl(part.file)} alt="" loading="lazy" />
+                    <span><Play size={14} fill="currentColor" /></span>
+                    <small>{formatTime(part.start)}-{formatTime(part.end)}</small>
+                  </button>
+                  <button className="picked-highlight-view" onClick={() => part.item ? viewHighlightReviewCandidate(part.item) : part.moment && viewConfirmedHighlightPart(part.file, part.moment)}>
+                    <strong>{part.file.name.replace(/\.[^.]+$/, "")}</strong>
+                    <small>{formatTime(part.start)}-{formatTime(part.end)} · {part.status === "confirmed" ? "saved highlight" : "AI uncertain"} · {part.action || part.source || "manual review"}</small>
+                  </button>
+                  <div className="picked-highlight-row-actions">
+                    {part.status === "confirmed" && part.moment ? (
+                      <>
+                        <button onClick={() => reconfirmHighlightPart(part.file, part.moment!)}><RotateCcw size={14} /> Reconfirm</button>
+                        <button onClick={() => void removeConfirmedHighlightPart(part.file, part.moment!)}><Trash2 size={14} /> Remove</button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => part.item && viewHighlightReviewCandidate(part.item)}><Play size={14} /> Review</button>
+                        <button disabled>{confidenceLabel(part.confidence)}</button>
+                      </>
+                    )}
+                  </div>
+                </article>
+              )) : <p>No AI uncertain highlight periods are available yet.</p>}
+            </div>
+            <div className="picked-highlight-actions">
+              {renderReviewMusicCoveragePrompt()}
+              <button onClick={addMoreHighlightCandidates}><Plus size={16} /> Add more</button>
+              <button className="confirm-highlight-button" disabled={!reviewGenerationReady || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate video</button>
+            </div>
+          </aside>
+        </div>
+      </main>
+    );
+  }
 
   function renderDashboard() {
     return (
@@ -1820,7 +3181,7 @@ function App() {
               <button className="hero-add-button" onClick={() => void chooseLocalFolder()}><FolderSearch size={20} /> Add game folder</button>
               <button className="text-action" onClick={() => recordingInput.current?.click()}>or add individual video files</button>
               <div className="workflow-preview">
-                <span><b>1</b> Add footage</span><ChevronRight size={16} /><span><b>2</b> Review AI picks</span><ChevronRight size={16} /><span><b>3</b> Generate</span>
+                <span><b>1</b> Add footage</span><ChevronRight size={16} /><span><b>2</b> Review moments</span><ChevronRight size={16} /><span><b>3</b> Generate</span>
               </div>
               {operationIssue && <div className="issue-card" role="alert"><AlertTriangle size={20} /><div><strong>{operationIssue.title}</strong><p>{operationIssue.message}</p>{operationIssue.action && <small>{operationIssue.action}</small>}</div></div>}
             </div>
@@ -1900,10 +3261,10 @@ function App() {
               )}
 
               <div className="clip-toolbar">
-                <div><h3>Your clips</h3><p>Select any number of ready clips. {semanticReadyFiles ? `Vision AI verified ${semanticReadyFiles} clip${semanticReadyFiles === 1 ? "" : "s"}` : "Local signal analysis"} ranked the strongest footage first.{pendingVisionCheckFiles ? ` ${pendingVisionCheckFiles} clip${pendingVisionCheckFiles === 1 ? " is" : "s are"} waiting for Vision AI.` : semanticUncertainFiles ? ` ${semanticUncertainFiles} clip${semanticUncertainFiles === 1 ? " is" : "s are"} AI uncertain.` : ""}</p></div>
+                <div><h3>Your clips</h3><p>Select any number of ready clips. {semanticReadyFiles ? `Vision AI confirmed ${semanticReadyFiles} highlight-ready clip${semanticReadyFiles === 1 ? "" : "s"}` : "Local signal analysis"} ranked the strongest footage first.{semanticRejectedFiles ? ` ${semanticRejectedFiles} low-signal clip${semanticRejectedFiles === 1 ? " was" : "s were"} excluded.` : ""}{pendingVisionCheckFiles ? ` ${pendingVisionCheckFiles} clip${pendingVisionCheckFiles === 1 ? " is" : "s are"} waiting for Vision AI.` : semanticUncertainFiles ? ` ${semanticUncertainFiles} clip${semanticUncertainFiles === 1 ? " is" : "s are"} still low confidence.` : ""}</p></div>
                 <div className="clip-toolbar-actions">
                   <span className="selected-count"><strong>{selectedVideoIds.length}</strong> selected</span>
-                  <button onClick={applySuggestedSelection}><Sparkles size={16} /> {semanticReadyFiles ? "Use AI picks" : "Use suggested picks"}</button>
+                  <button disabled={!reviewHighlightMoments.length && !reviewConfirmedHighlightParts.length} onClick={startHighlightReview}><Play size={16} /> Review moments</button>
                 </div>
               </div>
               <div className="library-controls">
@@ -1983,6 +3344,9 @@ function App() {
                         <span className={`clip-score ${pending ? "pending" : rating === "Local signal" ? "local" : rating === "AI uncertain" || rating === "AI checked" ? "assisted" : rating === "Pending review" ? "pending" : ""}`} title={ratingTitle}>
                           {ratingText}
                         </span>
+                        {!pending && file.metadata?.reviewed === true && (
+                          <span className="clip-user-verified" title="You already reviewed this clip. HighlightAI will not ask you to review it again.">user verified</span>
+                        )}
                         <small>{file.metadata?.duration ? formatTime(file.metadata.duration) : "Analyzing"}</small>
                       </button>
                       <div className="clip-copy">
@@ -1996,8 +3360,11 @@ function App() {
                   );
                 })}
               </div>
-              {visibleClipPage.length < visibleLibrary.length && (
-                <div ref={clipPageSentinel} className="clip-page-sentinel" aria-label="Loading more clips"><LoaderCircle size={17} /><span>Loading more clips...</span></div>
+              {hasMoreVisibleClips && (
+                <div ref={clipPageSentinel} className="clip-page-sentinel" aria-label="More clips available">
+                  <span>Showing {visibleClipPage.length} of {visibleLibrary.length} clips</span>
+                  <button type="button" onClick={() => setVisibleClipLimit((current) => Math.min(current + 40, visibleLibrary.length))}>Show more</button>
+                </div>
               )}
               {!visibleLibrary.length && <div className="empty-filter">No clips match this search or tag.</div>}
             </>
@@ -2019,7 +3386,7 @@ function App() {
                 <div>
                   <button onClick={openMusicBrowser}>{selectedAudioAsset ? "Change" : "Add music"}</button>
               <button className="apply-music-button" disabled={!selectedAudioAsset || ["processing", "queued", "paused"].includes(String(renderJob?.status || ""))} onClick={() => void renderSpecificDraft(drafts[activeDraft])}>
-                    {renderJob && !["completed", "failed"].includes(renderJob.status) ? "Rendering..." : "Apply & render"}
+                    {renderJob && !["completed", "needs_review", "failed", "cancelled"].includes(renderJob.status) ? "Rendering..." : "Apply & render"}
                   </button>
                 </div>
               </div>
@@ -2029,9 +3396,9 @@ function App() {
               </div>
               <div className="draft-actions">
                 <button disabled={!prompt.trim()} onClick={() => void refineDraft(prompt)}><WandSparkles size={16} /> Refine edit</button>
-                <button className="primary" disabled={["processing", "queued", "paused"].includes(String(renderJob?.status || ""))} onClick={() => void exportDraft()}><Check size={16} /> {renderJob && !["completed", "failed"].includes(renderJob.status) ? (renderJob.status === "paused" ? "Render paused" : "Rendering...") : drafts[activeDraft].exportUrl ? "Open export" : "Render MP4"}</button>
+                <button className="primary" disabled={["processing", "queued", "paused"].includes(String(renderJob?.status || ""))} onClick={() => void exportDraft()}><Check size={16} /> {renderJob && !["completed", "needs_review", "failed", "cancelled"].includes(renderJob.status) ? (renderJob.status === "paused" ? "Render paused" : "Rendering...") : drafts[activeDraft].exportUrl ? "Open export" : "Render MP4"}</button>
               </div>
-              {renderJob && !["completed", "failed"].includes(renderJob.status) && (
+              {renderJob && !["completed", "needs_review", "failed", "cancelled"].includes(renderJob.status) && (
                 <div className="background-task-card" aria-live="polite">
                   <LoaderCircle size={18} />
                   <div><strong>{renderJob.message}</strong><small>You can continue selecting clips, changing settings, or opening another folder.</small></div>
@@ -2071,15 +3438,15 @@ function App() {
 
           <div className="create-panel-footer">
             {generating ? (
-              <div className="generation-progress" aria-live="polite"><LoaderCircle size={18} /><span><strong>Creating your video</strong><small>Building two edit options from the selected clips...</small></span></div>
+              <div className="generation-progress" aria-live="polite"><LoaderCircle size={18} /><span><strong>Creating your video</strong><small>Building two edit options from the strongest confirmed moments...</small></span></div>
             ) : drafts.length > 0 ? (
               <button className="new-draft-button" onClick={() => { setDrafts([]); setStage("advice"); }}><RotateCcw size={17} /> Create another version</button>
             ) : (
               <div className={`selection-status ${generationReady ? "ready" : ""}`}>
                 {generationReady ? <Check size={17} /> : <AlertTriangle size={17} />}
                 <span>{!selectionReady
-                  ? folderImportActive ? "Footage is still being analyzed" : selectedVideoIds.length ? "Selected clips are still being analyzed" : "Select at least one clip to continue"
-                  : selectedAudioAsset ? `${selectedVideoIds.length} clips and music ready` : `${selectedVideoIds.length} clips ready; game audio only`}</span>
+                  ? folderImportActive ? "Footage is still being analyzed" : selectedVideoIds.length ? "Selected clips are still being analyzed" : "No confirmed clips are ready yet"
+                  : selectedAudioAsset ? `${generationSourceLabel} and music ready` : `${generationSourceLabel} ready; game audio only`}</span>
               </div>
             )}
             {!drafts.length && (
@@ -2099,7 +3466,7 @@ function App() {
             <header className="simple-create-heading">
               <span className="panel-label">Create video</span>
               <h2>{currentDraft?.exportUrl && !renderActive && !generating ? "Your video is ready" : "Generate your highlight"}</h2>
-              <p>{selectedVideoIds.length} clips selected. AI chooses the strongest moments and final duration.</p>
+              <p>{selectedVideoIds.length ? `${selectedVideoIds.length} clips selected.` : "No manual selection needed."} AI chooses the strongest confirmed moments and final duration.</p>
             </header>
 
             {operationIssue && project && (
@@ -2109,16 +3476,38 @@ function App() {
               </div>
             )}
 
+            {musicCoveragePrompt && (
+              <section className="music-coverage-card" role="alert" aria-label="Add more clips for selected music">
+                <div><Music2 size={17} /><strong>Add more clips for this soundtrack</strong></div>
+                <p>
+                  {musicCoveragePrompt.clipCount} ready clip{musicCoveragePrompt.clipCount === 1 ? "" : "s"} total {formatTime(musicCoveragePrompt.clipDuration)}, but {musicCoveragePrompt.musicName} needs {formatTime(musicCoveragePrompt.musicDuration)}.
+                </p>
+                <div>
+                  <button onClick={() => {
+                    setMusicCoveragePrompt(null);
+                    setNotice("Select more clips from the library, or add more footage before generating.");
+                  }}><Plus size={15} /> Select more clips</button>
+                  <button onClick={() => {
+                    const promptIdea = musicCoveragePrompt.idea;
+                    setMusicCoveragePrompt(null);
+                    void createDraft(promptIdea, { ignoreMusicCoverage: true });
+                  }}>Generate anyway</button>
+                </div>
+              </section>
+            )}
+
             <section className={`generation-advice-card ${selectedVerifiedMoments < 3 ? "needs-more" : "ready"}`} aria-label="Advice for a better video">
               <div><Sparkles size={17} /><strong>How to make this video better</strong></div>
-              {selectedVideoIds.length ? (
+              {generationSourceVideos.length ? (
                 <p>
-                  {generationAdvice || (selectedVerifiedMoments < 3
-                    ? `AI sees ${selectedVerifiedMoments} verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"} and ${selectedWeakOrStale} selected clip${selectedWeakOrStale === 1 ? " needs" : "s need"} a clearer AI decision. Generate will continue, but the result improves after Vision AI verifies complete visible results.`
-                    : `This selection has ${selectedVerifiedMoments} AI-verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"} plus ${selectedIndexedCandidates} indexed candidate moment${selectedIndexedCandidates === 1 ? "" : "s"}. For more variety, mix subjects, objectives, and final payoff moments.`)}
+                  {generationAdvice || (!selectedVideoIds.length
+                    ? `The editor will use ${generationSourceVideos.length} confirmed clip${generationSourceVideos.length === 1 ? "" : "s"}, reject low-signal footage, balance repeated actions, and build a paced arc automatically.`
+                    : selectedVerifiedMoments < 3
+                    ? `AI sees ${selectedVerifiedMoments} verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"} and ${selectedWeakOrStale} selected clip${selectedWeakOrStale === 1 ? " has" : "s have"} lower confidence. Generate will still auto-rank the strongest uncertain and indexed moments.`
+                    : `This selection has ${selectedVerifiedMoments} AI-verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"}, ${selectedConfirmedMoments} saved period${selectedConfirmedMoments === 1 ? "" : "s"}, and ${selectedIndexedCandidates} indexed candidate moment${selectedIndexedCandidates === 1 ? "" : "s"}. Confirmed periods are used first.`)}
                 </p>
               ) : (
-                <p>Select clips first. Use “Select top 20”, “Select all”, or “I'm feeling lucky”, then adjust the selection before generating.</p>
+                <p>No confirmed highlight-ready clips are available yet. Let Vision AI finish indexing this folder, then generation can build from the strongest moments automatically.</p>
               )}
             </section>
 
@@ -2129,6 +3518,11 @@ function App() {
                 {audioAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
               </select>
               <button onClick={() => assetInput.current?.click()}><Plus size={16} /> Add music file</button>
+              <label htmlFor="music-repeat-select">Video length</label>
+              <select id="music-repeat-select" value={musicRepeats} onChange={(event) => setMusicRepeats(Number(event.target.value) === 2 ? 2 : 1)}>
+                <option value={1}>Use music once</option>
+                <option value={2}>Play music twice, up to 5 min</option>
+              </select>
               <small>Music already added to this project appears in the list.</small>
             </section>
 
@@ -2195,11 +3589,13 @@ function App() {
             <div className={`selection-status ${generationReady ? "ready" : ""}`}>
               {generationReady ? <Check size={17} /> : <AlertTriangle size={17} />}
               <span>{selectionReady
-                ? `${selectedVideoIds.length} clips ready`
-                : folderImportActive ? "Footage is still being analyzed" : selectedVideoIds.length ? "Selected clips are still being analyzed" : "Select at least one clip"}</span>
+                ? `${generationSourceLabel} ready`
+                : folderImportActive ? "Footage is still being analyzed" : selectedVideoIds.length ? "Selected clips are still being analyzed" : "No confirmed clips are ready yet"}</span>
             </div>
             <button className="generate-button" disabled={!project || !recommendedIdea || !generationReady || generating || renderActive} onClick={() => recommendedIdea && void createDraft(recommendedIdea)}>
-              {generating || renderActive ? <><LoaderCircle size={19} /> Generating...</> : <><Sparkles size={19} /> Generate video</>}
+              {generating || renderActive
+                ? <><LoaderCircle size={19} /> Generating...</>
+                : <><Sparkles size={19} /> Generate video</>}
             </button>
             <small className="duration-note"><Clock3 size={14} /> AI chooses the best duration, up to 5 minutes.</small>
           </div>
@@ -2227,7 +3623,6 @@ function App() {
           <span className="brand-mark"><Sparkles size={18} /></span>
           <span>Highlight<span>AI</span></span>
         </button>
-        <div className="limit-pill"><Clock3 size={14} /> Highlights up to 5 minutes</div>
         <nav>
           <button className="ghost-button" onClick={openMusicBrowser}><Music2 size={16} /> Music <span>{audioAssets.length || ""}</span></button>
           <button className="icon-button" aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`} title={`Use ${theme === "dark" ? "light" : "dark"} theme`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}</button>
@@ -2235,7 +3630,7 @@ function App() {
         </nav>
       </header>
 
-      {renderDashboard()}
+      {appRoute === "review" ? renderHighlightReviewPage() : renderDashboard()}
 
       <main className="legacy-ui" hidden aria-hidden="true">
         {stage === "start" && (
@@ -2483,7 +3878,7 @@ function App() {
             <div className="video-library">
               <div className="library-header">
                 <div><span>Path contents</span><h3>Choose source videos</h3><small>Showing all {rankedLibrary.length} videos from this path. {selectedVideoIds.length} selected for the next edit.</small></div>
-                <button onClick={applySuggestedSelection}><Sparkles size={15} /> AI suggest</button>
+                <button onClick={selectDiversifiedClips}><Sparkles size={15} /> I'm feeling lucky</button>
               </div>
               {selectedVideoIds.length < 1
                 ? <div className="selection-warning"><AlertTriangle size={15} /> Select at least one video before creating a trailer.</div>
@@ -2587,6 +3982,140 @@ function App() {
           </section>
         )}
       </main>
+
+      {false && highlightReview && activeHighlightReviewItem && activeHighlightTrim && (
+        <div className="modal-backdrop media-viewer-backdrop" onClick={() => setHighlightReview(null)}>
+          <section className="highlight-review-modal" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <span className="panel-label">Highlight confirmation</span>
+                <h3>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : "Picked highlight parts"}</h3>
+                <p>{activeHighlightReviewItem && activeHighlightTrim
+                  ? `${highlightReview!.index + 1} of ${highlightReview!.items.length} · ${activeHighlightReviewItem.label} · ${formatTime(activeHighlightTrim.start)}-${formatTime(activeHighlightTrim.end)}`
+                  : `${selectedConfirmedHighlightParts.length} confirmed part${selectedConfirmedHighlightParts.length === 1 ? "" : "s"} ready`}</p>
+              </div>
+              <button aria-label="Close highlight review" onClick={() => setHighlightReview(null)}><X size={20} /></button>
+            </header>
+            <div className="highlight-review-workspace">
+              <div className="highlight-review-stage">
+                {activeHighlightReviewItem && activeHighlightTrim ? (
+                  <>
+                    <video
+                      ref={highlightReviewVideo}
+                      src={sourceVideoUrl(activeHighlightReviewItem.file)}
+                      controls
+                      preload="metadata"
+                      onTimeUpdate={handleHighlightReviewTime}
+                      onPause={() => {
+                        clearHighlightPlaybackGuard();
+                        setHighlightReviewPlaying(false);
+                      }}
+                      onEnded={() => {
+                        clearHighlightPlaybackGuard();
+                        setHighlightReviewPlaying(false);
+                      }}
+                    />
+                    <div className="highlight-trim-box" aria-label="Video cut controls">
+                      <div className="highlight-trim-line">
+                        <label>
+                          <span>Start</span>
+                          <strong>{formatTime(activeHighlightTrim.start)}</strong>
+                        </label>
+                        <input
+                          aria-label="Trim start"
+                          type="range"
+                          min={0}
+                          max={Math.max(0, (activeHighlightReviewItem.file.metadata?.duration || activeHighlightReviewItem.end) - 1)}
+                          step="0.1"
+                          value={activeHighlightTrim.start}
+                          onChange={(event) => updateHighlightTrim("start", Number(event.target.value))}
+                        />
+                        <ArrowRight className="trim-arrow" size={16} />
+                        <label>
+                          <span>End</span>
+                          <strong>{formatTime(activeHighlightTrim.end)}</strong>
+                        </label>
+                        <input
+                          aria-label="Trim end"
+                          type="range"
+                          min={1}
+                          max={activeHighlightReviewItem.file.metadata?.duration || activeHighlightReviewItem.end}
+                          step="0.1"
+                          value={activeHighlightTrim.end}
+                          onChange={(event) => updateHighlightTrim("end", Number(event.target.value))}
+                        />
+                      </div>
+                      <small>Do you agree this is a highlight period? Cut bad lead-in or tail before confirming. Generation will use this trimmed period first.</small>
+                    </div>
+                    <footer className="highlight-review-controls">
+                      <button disabled={highlightReview!.index === 0} onClick={() => moveHighlightReview(-1)}><ArrowLeft size={16} /> Previous</button>
+                      <button onClick={highlightReviewPlaying ? stopHighlightReview : playHighlightReview}>
+                        {highlightReviewPlaying ? <Square size={16} /> : <Play size={16} fill="currentColor" />}
+                        {highlightReviewPlaying ? "Stop" : "Play period"}
+                      </button>
+                      <button disabled={highlightReview!.index >= highlightReview!.items.length - 1} onClick={() => moveHighlightReview(1)}>Next <ArrowRight size={16} /></button>
+                      <button onClick={() => void skipCurrentHighlightThisTime()}><X size={16} /> Skip this time</button>
+                      <button className="reject-highlight-button" onClick={() => void rejectCurrentHighlightAsNotHighlight()}><Trash2 size={16} /> Not a highlight</button>
+                      <button className="confirm-highlight-button" onClick={() => void confirmCurrentHighlight()}><Check size={16} /> {activeHighlightReviewItem.confirmed ? "Confirmed" : "Agree, use it"}</button>
+                    </footer>
+                  </>
+                ) : (
+                  <div className="highlight-review-empty">
+                    <Check size={24} />
+                    <strong>{selectedConfirmedHighlightParts.length ? "Review complete" : "No picked parts yet"}</strong>
+                    <span>{selectedConfirmedHighlightParts.length ? "Check the picked parts list, add more if needed, then generate." : "Add more candidates or close this window."}</span>
+                  </div>
+                )}
+              </div>
+              <aside className="picked-highlight-panel">
+                <div>
+                  <span className="panel-label">Picked parts</span>
+                  <strong>{selectedConfirmedHighlightParts.length} confirmed</strong>
+                </div>
+                <div className="picked-highlight-list">
+                  {selectedConfirmedHighlightParts.length ? selectedConfirmedHighlightParts.map(({ file, moment, id }) => (
+                    <article key={id}>
+                      <strong>{file.name.replace(/\.[^.]+$/, "")}</strong>
+                      <small>{formatTime(moment.start)}-{formatTime(moment.end)} · {moment.action || moment.source || "highlight"}</small>
+                      <button onClick={() => reconfirmHighlightPart(file, moment)}><RotateCcw size={14} /> Reconfirm</button>
+                    </article>
+                  )) : <p>No confirmed highlight parts yet.</p>}
+                </div>
+                <div className="picked-highlight-actions">
+                  {renderReviewMusicCoveragePrompt()}
+                  <button onClick={addMoreHighlightCandidates}><Plus size={16} /> Add more</button>
+                  <button className="confirm-highlight-button" disabled={!recommendedIdea || !generationReady || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate video</button>
+                </div>
+              </aside>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {reviewGeneratePrompt && highlightReview && pendingReviewDraftId && (
+        <div className="modal-backdrop" onClick={() => { setReviewGeneratePrompt(false); setReviewGeneratePromptDismissed(true); }}>
+          <section className="asset-modal review-generate-modal" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <div className="eyebrow"><span /> Ready to generate</div>
+                <h3>Generate this reviewed video?</h3>
+              </div>
+              <button aria-label="Keep reviewing" onClick={() => { setReviewGeneratePrompt(false); setReviewGeneratePromptDismissed(true); }}><X size={18} /></button>
+            </header>
+            <div className="review-generate-summary">
+              <Check size={22} />
+              <div>
+                <strong>{highlightReview.confirmed} approved part{highlightReview.confirmed === 1 ? "" : "s"} will be used</strong>
+                <p>All planned parts are reviewed. HighlightAI will save your trimmed timeline and start rendering after you confirm.</p>
+              </div>
+            </div>
+            <div className="review-generate-actions">
+              <button onClick={() => { setReviewGeneratePrompt(false); setReviewGeneratePromptDismissed(true); }}>Keep reviewing</button>
+              <button className="confirm-highlight-button" disabled={generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate now</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {previewVideo && (
         <div className="modal-backdrop media-viewer-backdrop" onClick={() => setPreviewVideo(null)}>
@@ -2759,7 +4288,7 @@ function App() {
         </div>
       )}
       {busy && <div className="activity-indicator" aria-live="polite"><LoaderCircle size={19} /><div><strong>{busy}</strong><span>You can keep using HighlightAI.</span></div></div>}
-      {notice && <div className="toast"><Sparkles size={16} /><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice("")}><X size={15} /></button></div>}
+      {notice && <div className="toast" key={notice}><Sparkles size={16} /><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice("")}><X size={15} /></button></div>}
     </div>
   );
 }

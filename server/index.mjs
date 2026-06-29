@@ -1,14 +1,14 @@
 import express from "express";
 import multer from "multer";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, rm, stat, statfs } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
-import { alignTrailerSegmentsToMusic, analyzeActionSignals, analyzeCandidateWindows, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, probe, recommendTrailerDuration, refineDraftPlan, renderHighlight, run, saveJson } from "./media.mjs";
+import { alignTrailerSegmentsToMusic, analyzeActionSignals, analyzeCandidateWindows, applyVisualReviewEditsToDraft, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, fitTimelineToDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, polishFinalTimeline, probe, recommendTrailerDuration, refineDraftPlan, renderHighlight, run, saveJson } from "./media.mjs";
 
 process.on("uncaughtException", (error) => {
   console.error("UNCAUGHT_EXCEPTION", error);
@@ -33,6 +33,7 @@ const MAX_FILE_BYTES = 30 * 1024 * 1024 * 1024;
 const DEFAULT_FRAME_INTERVAL = 3;
 const SEMANTIC_REVIEW_VERSION = 2;
 const MAX_SEMANTIC_REVIEW_ATTEMPTS = 2;
+const DEFAULT_MAX_VISION_CHECK_SECONDS = 30 * 60;
 const FAST_INDEX_MIN_WINDOWS = 6;
 const preprocessSecrets = new Map();
 const renderReviewSecrets = new Map();
@@ -399,6 +400,17 @@ app.get("/api/projects/:id", async (req, res, next) => {
   try { res.json(await loadProject(req.params.id)); } catch (error) { next(error); }
 });
 
+app.get("/api/projects/:id/ai-coverage", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.id);
+    if (normalizeAiDecisions(project)) {
+      project.analysis = buildAnalysis(project.files || []);
+      await saveProject(project);
+    }
+    res.json(buildAiCoverageReport(project));
+  } catch (error) { next(error); }
+});
+
 app.post("/api/projects/:id/reconcile", async (req, res, next) => {
   try {
     const project = await loadProject(req.params.id);
@@ -523,6 +535,8 @@ app.post("/api/projects/:id/reconcile", async (req, res, next) => {
       project.files = nextFiles;
     }
 
+    if (normalizeAiDecisions(project)) changed = true;
+
     if (changed) {
       project.analysis = buildAnalysis(project.files);
       await saveProject(project);
@@ -577,6 +591,125 @@ app.get("/api/projects/:projectId/files/:fileId/stream", async (req, res, next) 
   } catch (error) { next(error); }
 });
 
+app.post("/api/projects/:projectId/files/:fileId/highlight-confirmations", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.projectId);
+    const file = project.files.find((item) => item.id === req.params.fileId);
+    if (!file?.metadata?.duration) return res.status(404).json({ error: "Video not found" });
+    const start = Math.max(0, Number(req.body.start) || 0);
+    const end = Math.min(Number(file.metadata.duration) || start, Number(req.body.end) || start);
+    if (end - start < 1) {
+      return res.status(400).json({ error: structuredError("Highlight period is too short", "Keep at least one second of footage after trimming.", "Move the start or end trim control and confirm again.", true) });
+    }
+    const moment = {
+      start: Math.round(start * 10) / 10,
+      end: Math.round(end * 10) / 10,
+      duration: Math.round((end - start) * 10) / 10,
+      score: Math.max(1, Math.min(100, Math.round(Number(req.body.score) || Number(file.metadata.indexScore) || 75))),
+      state: String(req.body.state || "human-confirmed").slice(0, 60),
+      action: String(req.body.action || "confirmed highlight").slice(0, 120),
+      storyRole: String(req.body.storyRole || "payoff").slice(0, 60),
+      source: String(req.body.source || "human-confirmed").slice(0, 60),
+      confirmedAt: new Date().toISOString()
+    };
+    const previous = Array.isArray(file.metadata.confirmedHighlightMoments)
+      ? file.metadata.confirmedHighlightMoments
+      : [];
+    const replaceStart = Number.isFinite(Number(req.body.replaceStart)) ? Math.max(0, Number(req.body.replaceStart)) : moment.start;
+    const replaceEnd = Number.isFinite(Number(req.body.replaceEnd)) ? Math.min(Number(file.metadata.duration) || replaceStart, Number(req.body.replaceEnd)) : moment.end;
+    const overlapsRange = (item, rangeStart, rangeEnd) =>
+      Math.max(Number(item.start) || 0, rangeStart) < Math.min(Number(item.end) || (Number(item.start) || 0) + (Number(item.duration) || 0), rangeEnd) - 0.75;
+    const withoutOverlap = previous.filter((item) =>
+      !overlapsRange(item, moment.start, moment.end) && !overlapsRange(item, replaceStart, replaceEnd)
+    );
+    file.metadata.confirmedHighlightMoments = [...withoutOverlap, moment]
+      .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, 6);
+    file.metadata.reviewed = true;
+    file.metadata.reviewedAt = new Date().toISOString();
+    file.metadata.semanticQuality = file.metadata.semanticQuality === "verified" ? file.metadata.semanticQuality : "weak";
+    file.metadata.ratingConfidence = "high";
+    project.analysis = buildAnalysis(project.files);
+    await saveProject(project);
+    res.json(project);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/projects/:projectId/files/:fileId/highlight-review", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.projectId);
+    const file = project.files.find((item) => item.id === req.params.fileId);
+    if (!file?.metadata?.duration) return res.status(404).json({ error: "Video not found" });
+    file.metadata.reviewed = req.body?.reviewed !== false;
+    file.metadata.reviewedAt = new Date().toISOString();
+    project.analysis = buildAnalysis(project.files);
+    await saveProject(project);
+    res.json(project);
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/projects/:projectId/files/:fileId/highlight-confirmations", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.projectId);
+    const file = project.files.find((item) => item.id === req.params.fileId);
+    if (!file?.metadata?.duration) return res.status(404).json({ error: "Video not found" });
+    const start = Math.max(0, Number(req.body.start) || 0);
+    const end = Math.min(Number(file.metadata.duration) || start, Number(req.body.end) || start);
+    if (end - start < 1) {
+      return res.status(400).json({ error: structuredError("Confirmed period is too short", "Keep at least one second in the period you remove.", "Choose a saved highlight period again.", true) });
+    }
+    const overlaps = (item) =>
+      Math.max(Number(item.start) || 0, start) < Math.min(Number(item.end) || (Number(item.start) || 0) + (Number(item.duration) || 0), end) - 0.75;
+    file.metadata.confirmedHighlightMoments = (file.metadata.confirmedHighlightMoments || []).filter((item) => !overlaps(item));
+    project.analysis = buildAnalysis(project.files);
+    await saveProject(project);
+    res.json(project);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/projects/:projectId/files/:fileId/highlight-rejections", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.projectId);
+    const file = project.files.find((item) => item.id === req.params.fileId);
+    if (!file?.metadata?.duration) return res.status(404).json({ error: "Video not found" });
+    const start = Math.max(0, Number(req.body.start) || 0);
+    const end = Math.min(Number(file.metadata.duration) || start, Number(req.body.end) || start);
+    if (req.body.reason !== "not-highlight") {
+      return res.status(400).json({ error: structuredError("Discard reason is not supported", "Only permanent not-highlight rejections are saved.", "Choose one of the discard options again.", true) });
+    }
+    if (end - start < 1) {
+      return res.status(400).json({ error: structuredError("Rejected period is too short", "Keep at least one second of footage in the rejected range.", "Move the start or end trim control and try again.", true) });
+    }
+    const rejection = {
+      start: Math.round(start * 10) / 10,
+      end: Math.round(end * 10) / 10,
+      duration: Math.round((end - start) * 10) / 10,
+      reason: "not-highlight",
+      source: String(req.body.source || "human-review").slice(0, 60),
+      rejectedAt: new Date().toISOString()
+    };
+    const overlaps = (item) =>
+      Math.max(Number(item.start) || 0, rejection.start) < Math.min(Number(item.end) || (Number(item.start) || 0) + (Number(item.duration) || 0), rejection.end) - 0.75;
+    const previous = Array.isArray(file.metadata.rejectedHighlightMoments)
+      ? file.metadata.rejectedHighlightMoments
+      : [];
+    file.metadata.rejectedHighlightMoments = [...previous.filter((item) => !overlaps(item)), rejection]
+      .sort((a, b) => Date.parse(b.rejectedAt || "") - Date.parse(a.rejectedAt || ""))
+      .slice(0, 12);
+    file.metadata.confirmedHighlightMoments = (file.metadata.confirmedHighlightMoments || []).filter((item) => !overlaps(item));
+    file.metadata.semanticEvents = (file.metadata.semanticEvents || []).filter((item) => !overlaps(item));
+    file.metadata.semanticCandidateHistory = (file.metadata.semanticCandidateHistory || []).filter((item) => !overlaps(item));
+    file.metadata.candidateWindows = (file.metadata.candidateWindows || []).filter((item) => !overlaps(item));
+    file.metadata.reviewed = true;
+    file.metadata.reviewedAt = new Date().toISOString();
+    if (Number(file.metadata.semanticTopFrame) >= rejection.start && Number(file.metadata.semanticTopFrame) <= rejection.end) delete file.metadata.semanticTopFrame;
+    if (Number(file.metadata.highlightStart) >= rejection.start && Number(file.metadata.highlightStart) <= rejection.end) delete file.metadata.highlightStart;
+    project.analysis = buildAnalysis(project.files);
+    await saveProject(project);
+    res.json(project);
+  } catch (error) { next(error); }
+});
+
 const previewTasks = new Map();
 app.get("/api/projects/:projectId/files/:fileId/preview", async (req, res, next) => {
   try {
@@ -619,7 +752,7 @@ app.get("/api/projects/:projectId/files/:fileId/thumbnail", async (req, res, nex
       if (!thumbnailTasks.has(key)) {
         const at = Math.max(0, Math.min(
           Number(file.metadata.duration || 0) - 0.25,
-          Number(file.metadata.semanticTopFrame ?? file.metadata.highlightStart ?? file.metadata.duration * 0.55)
+          reliableFocusTime(file)
         ));
         thumbnailTasks.set(key, run("ffmpeg", [
           "-y", "-ss", String(at), "-i", file.path,
@@ -671,6 +804,7 @@ app.post("/api/projects/:id/public-audio", async (req, res, next) => {
     const download = await fetch(`https://archive.org/download/${identifier}/${encodeURIComponent(file.name).replaceAll("%2F", "/")}`);
     if (!download.ok || !download.body) throw new Error("Could not download the selected public asset.");
     await pipeline(download.body, createWriteStream(destination));
+    const duration = await audioAssetDuration(destination);
     const project = await loadProject(req.params.id);
     project.assets.push({
       id: randomUUID(),
@@ -678,6 +812,7 @@ app.post("/api/projects/:id/public-audio", async (req, res, next) => {
       path: destination,
       url: `/media/uploads/${safeName}`,
       size: Number(file.size || 0),
+      ...(duration ? { duration } : {}),
       source: "public",
       sourceUrl: `https://archive.org/details/${identifier}`,
       creator: metadata.metadata?.creator || req.body.creator || "Unknown creator",
@@ -706,12 +841,14 @@ app.post("/api/projects/:id/assets", upload.array("files", 20), async (req, res,
       }
       const duplicate = project.assets.find((asset) => asset.contentHash === hash);
       if (duplicate) continue;
+      const duration = isAudioAssetName(file.originalname) ? await audioAssetDuration(canonicalPath) : null;
       project.assets.push({
         id: randomUUID(),
         name: file.originalname,
         path: canonicalPath,
         url: `/media/uploads/${path.basename(canonicalPath)}`,
         size: file.size,
+        ...(duration ? { duration } : {}),
         contentHash: hash
       });
     }
@@ -760,16 +897,367 @@ function createAdviceFallbackPlan(files, targetDuration, intensity = 78, reason 
   };
 }
 
+function buildAutoHighlightPlan(files, targetDuration, options = {}) {
+  const baseOptions = {
+    gameGenre: options.gameGenre,
+    excludedIntervals: options.excludedIntervals,
+    qualityFirst: true
+  };
+  const strictPlan = buildAgenticEditPlan(files, targetDuration, {
+    ...baseOptions,
+    minScore: options.minScore ?? 64,
+    requireVerifiedVision: true,
+    allowReviewCandidates: false
+  });
+  if (strictPlan.segments?.length && (strictPlan.workflow?.critique?.approved || strictPlan.segments.length >= 3)) {
+    strictPlan.workflow.status = "verified-ai";
+    strictPlan.workflow.advice = "AI verified enough complete highlight moments for automatic generation.";
+    return strictPlan;
+  }
+
+  const autoRankedPlan = buildAgenticEditPlan(files, targetDuration, {
+    ...baseOptions,
+    minScore: options.relaxedMinScore ?? 58,
+    reviewCandidateMinScore: options.reviewCandidateMinScore ?? 64,
+    requireVerifiedVision: true,
+    allowReviewCandidates: true,
+    allowWeakReviewCandidates: true,
+    allowSemanticSummaryCandidates: true,
+    allowIndexedAfterUncertainVision: true,
+    qualityFirst: false
+  });
+  if (autoRankedPlan.segments?.length) {
+    autoRankedPlan.workflow.status = strictPlan.segments?.length ? "verified-plus-auto-ranked" : "auto-ranked-candidates";
+    autoRankedPlan.workflow.advice = "AI used verified moments first, then auto-ranked strong uncertain and indexed candidates without requiring manual review.";
+    autoRankedPlan.workflow.strictCandidateCount = strictPlan.segments?.length || 0;
+    return autoRankedPlan;
+  }
+
+  return createAdviceFallbackPlan(
+    files,
+    targetDuration,
+    options.intensity ?? 78,
+    "AI did not find enough strong verified or uncertain candidates yet, so this draft uses the best available local signal moments."
+  );
+}
+
+function isUserReviewedDraft(draft = {}) {
+  return draft.workflow?.status === "user-reviewed" ||
+    draft.workflow?.stage === "user-reviewed" ||
+    (draft.segments || []).some((segment) => /human-reviewed|user-reviewed/i.test(String(segment.source || "")));
+}
+
+function buildUserReviewedPlan(draft, files, targetDuration) {
+  const fileById = new Map(files.map((file) => [file.id, file]));
+  const segments = (draft.segments || [])
+    .map((segment) => {
+      const file = fileById.get(String(segment.fileId || ""));
+      if (!file?.metadata?.duration) return null;
+      const sourceDuration = Math.max(1, Number(file.metadata.duration) || 1);
+      const start = Math.max(0, Math.min(sourceDuration - 1, Number(segment.start) || 0));
+      const duration = Math.max(1, Math.min(sourceDuration - start, Number(segment.duration) || 0));
+      if (duration < 1) return null;
+      return {
+        fileId: file.id,
+        start: Math.round(start * 100) / 100,
+        duration: Math.round(duration * 100) / 100,
+        minDuration: Math.round(duration * 100) / 100,
+        score: Math.round(Number(segment.score) || Number(file.metadata.semanticScore) || Number(file.metadata.indexScore) || 80),
+        storyRole: segment.storyRole || "approved highlight",
+        source: "human-reviewed",
+        confidence: "high"
+      };
+    })
+    .filter(Boolean);
+  const duration = Math.round(segments.reduce((sum, segment) => sum + Number(segment.duration || 0), 0) * 10) / 10;
+  const requestedDuration = Math.min(MAX_DURATION, Math.max(1, Number(targetDuration) || duration || 1));
+  const uniqueFiles = new Set(segments.map((segment) => segment.fileId));
+  return {
+    segments,
+    duration,
+    workflow: {
+      ...(draft.workflow || {}),
+      version: 1,
+      status: "user-reviewed",
+      stage: "user-reviewed",
+      lockedReviewedCuts: true,
+      requestedDuration,
+      selectedMoments: segments.length,
+      rejectedMoments: Number(draft.workflow?.rejectedMoments || 0),
+      sourceVideosUsed: uniqueFiles.size,
+      specialists: {
+        action: "User reviewed and approved these exact highlight periods.",
+        boringFrames: "Trimmed user-reviewed cuts are locked for render.",
+        story: "Generation uses the approved timeline without rebuilding from older candidates.",
+        diversity: `${uniqueFiles.size} source video${uniqueFiles.size === 1 ? "" : "s"} represented.`
+      },
+      critique: {
+        approved: segments.length > 0,
+        score: segments.length ? 100 : 0,
+        coverage: requestedDuration ? Math.round((duration / requestedDuration) * 100) : 100,
+        duplicateIntervals: 0,
+        payoffMoments: segments.length,
+        lowConfidenceMoments: 0,
+        action: "User-approved highlight periods are preserved.",
+        boringFrames: "User trims override automatic timing.",
+        story: "This timeline is ready because the user confirmed every selected part.",
+        diversity: `${uniqueFiles.size} source video${uniqueFiles.size === 1 ? "" : "s"} represented.`
+      },
+      advice: "Using user-reviewed highlight periods exactly as confirmed."
+    }
+  };
+}
+
+function hasStrongSemanticSummary(file) {
+  const metadata = file?.metadata || {};
+  if (hasBoringSemanticEvidence(file)) return false;
+  const rating = metadata.semanticRating || {};
+  const traits = metadata.semanticTraits || {};
+  const reject = String(rating.excludeReason || "none").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "boring_travel", "walking", "waiting", "weak_aim", "unreadable", "duplicate"]);
+  if (hardRejects.has(reject)) return false;
+  if (Number(rating.boredom || 0) >= 60) return false;
+  if (Number(traits.clarity || 0) < 60 || Number(traits.obstruction || 0) > 50) return false;
+  const text = `${traits.action || ""} ${metadata.semanticRejectReason || ""} ${(metadata.semanticTags || []).join(" ")}`.toLowerCase();
+  const strongScore = Number(metadata.semanticScore || 0) >= 70
+    || (Number(rating.trailerUsefulness || 0) >= 70 && (Number(traits.intensity || 0) >= 70 || Number(traits.spectacle || 0) >= 70));
+  const decisiveText = /explosion|destroy|destruction|detonat|sniper|headshot|vehicle|air combat|shoot|shot|objective|capture|kill/i.test(text)
+    && Number(traits.intensity || 0) >= 70;
+  return strongScore || decisiveText || (traits.payoffVerified === true && Number(metadata.semanticScore || 0) >= 70);
+}
+
+function hasFinalSemanticReview(file) {
+  const metadata = file?.metadata || {};
+  if (metadata.semanticReviewLastError) return false;
+  const attempts = Number(metadata.semanticReviewAttemptVersion || 0) === SEMANTIC_REVIEW_VERSION
+    ? Number(metadata.semanticReviewAttempts || 0)
+    : 0;
+  return metadata.semanticFineReviewed === true || attempts >= MAX_SEMANTIC_REVIEW_ATTEMPTS;
+}
+
+function hasBoringSemanticEvidence(file) {
+  const metadata = file?.metadata || {};
+  if (!hasFinalSemanticReview(file) || hasVerifiedSemanticReview(file) || (metadata.confirmedHighlightMoments || []).length > 0) return false;
+  const rating = metadata.semanticRating || {};
+  const reject = String(rating.excludeReason || metadata.semanticRejectReason || "").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "unreadable", "duplicate"]);
+  if (reject.split(/[^a-z_]+/).some((part) => hardRejects.has(part))) return true;
+  const reason = String(metadata.semanticRejectReason || "").toLowerCase();
+  if (/\b(menu|scoreboard|loading screen|map screen|death screen|unreadable|duplicate)\b/i.test(reason)) return true;
+  return false;
+}
+
+function hasHardRenderRejectEvidence(file) {
+  const metadata = file?.metadata || {};
+  if ((metadata.confirmedHighlightMoments || []).length > 0 || hasVerifiedSemanticReview(file)) return false;
+  if (hasBoringSemanticEvidence(file)) return true;
+  const rating = metadata.semanticRating || {};
+  const reject = String(rating.excludeReason || metadata.semanticRejectReason || "").toLowerCase();
+  const reason = String(metadata.semanticRejectReason || "").toLowerCase();
+  const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "walking", "waiting", "weak_aim", "unreadable", "duplicate"]);
+  return reject.split(/[^a-z_]+/).some((part) => hardRejects.has(part)) ||
+    /\b(menu|scoreboard|loading|map|death|walking|waiting|weak aim|unreadable|duplicate)\b/i.test(reason);
+}
+
+function hasRecoverableGameplaySignal(file) {
+  const metadata = file?.metadata || {};
+  if (!metadata.duration || metadata.videoCodec === "pending") return false;
+  if (hasBoringSemanticEvidence(file)) return false;
+  return Number(metadata.indexScore || 0) >= 30 || Number(metadata.actionScore || 0) >= 20;
+}
+
+function reliableFocusTime(file) {
+  const metadata = file?.metadata || {};
+  const semanticEvents = [...(metadata.semanticEvents || []), ...(metadata.semanticCandidateHistory || [])];
+  const weakVisionMiss = Number(metadata.semanticFramesReviewed || 0) > 0 &&
+    !semanticEvents.length &&
+    (metadata.ratingConfidence === "low" || metadata.semanticQuality === "missed" || Number(metadata.semanticScore || 0) < 25);
+  if (weakVisionMiss && Number.isFinite(Number(metadata.highlightStart))) return Number(metadata.highlightStart);
+  return Number(metadata.semanticTopFrame ?? metadata.highlightStart ?? Number(metadata.duration || 0) * 0.55);
+}
+
+function metadataIntervalEnd(item) {
+  const start = Number(item?.start) || 0;
+  return Number(item?.end) || start + (Number(item?.duration) || 0);
+}
+
+function overlapsRejectedHighlight(metadata = {}, start = 0, end = start) {
+  return (metadata.rejectedHighlightMoments || []).some((item) =>
+    item?.reason === "not-highlight" &&
+    Math.max(Number(item.start) || 0, start) < Math.min(metadataIntervalEnd(item), end) - 0.75
+  );
+}
+
+function hasAutoUsableHighlightCandidate(file) {
+  const metadata = file?.metadata || {};
+  if (metadata.aiDecision === "rejected" || hasBoringSemanticEvidence(file)) return false;
+  if (metadata.aiDecision === "confirmed") return true;
+  if (hasVerifiedSemanticReview(file)) return true;
+  if ((metadata.confirmedHighlightMoments || []).length > 0) return true;
+  if ((metadata.semanticCandidateHistory || []).some((event) => Number(event?.score || 0) >= 64 && !overlapsRejectedHighlight(metadata, Number(event.start) || 0, Number(event.end) || Number(event.start) + Number(event.duration || 0)))) return true;
+  if ((metadata.candidateWindows || []).some((window) => Number(window?.score || 0) >= 72 && !overlapsRejectedHighlight(metadata, Number(window.start) || 0, Number(window.end) || Number(window.start) + Number(window.duration || 0)))) return true;
+  return hasStrongSemanticSummary(file) || hasRecoverableGameplaySignal(file);
+}
+
+function aiDecisionForFile(file) {
+  const metadata = file?.metadata || {};
+  if (!file || looksLikePreviousExport(file.name) || !metadata.duration || metadata.videoCodec === "pending") {
+    return { decision: "pending", reason: "Waiting for source video analysis." };
+  }
+  if (hasBoringSemanticEvidence(file)) {
+    return { decision: "rejected", reason: metadata.semanticRejectReason || "AI rejected this clip as low-signal gameplay without a visible payoff." };
+  }
+  if (hasVerifiedSemanticReview(file) || (metadata.confirmedHighlightMoments || []).length > 0) {
+    return { decision: "confirmed", reason: "Vision AI confirmed a complete highlight payoff." };
+  }
+  const hasSemanticCandidate = (metadata.semanticCandidateHistory || []).some((event) =>
+    Number(event?.score || 0) >= 64 &&
+    !overlapsRejectedHighlight(metadata, Number(event.start) || 0, metadataIntervalEnd(event))
+  );
+  const hasIndexedCandidate = (metadata.candidateWindows || []).some((window) =>
+    Number(window?.score || 0) >= 72 &&
+    !overlapsRejectedHighlight(metadata, Number(window.start) || 0, metadataIntervalEnd(window))
+  );
+  if (hasSemanticCandidate || hasIndexedCandidate || hasStrongSemanticSummary(file)) {
+    return { decision: "confirmed", reason: "AI ranker confirmed this clip has enough highlight evidence for generation." };
+  }
+  if (hasRecoverableGameplaySignal(file)) {
+    return { decision: "confirmed", reason: "Local ranker kept this gameplay clip usable because Vision AI did not prove it was a non-highlight." };
+  }
+  if (hasFinalSemanticReview(file)) {
+    return { decision: "low_confidence", reason: metadata.semanticRejectReason || "AI could not confirm a complete highlight after two checks." };
+  }
+  return { decision: "pending", reason: "Vision AI review is not finished." };
+}
+
+function normalizeAiDecisions(project) {
+  let changed = false;
+  const now = new Date().toISOString();
+  for (const file of project.files || []) {
+    if (!file.metadata) continue;
+    const { decision, reason } = aiDecisionForFile(file);
+    if (file.metadata.aiDecision !== decision || file.metadata.aiDecisionReason !== reason) {
+      file.metadata.aiDecision = decision;
+      file.metadata.aiDecisionReason = reason;
+      file.metadata.aiDecisionUpdatedAt = now;
+      changed = true;
+    }
+    if (decision === "rejected") {
+      const before = JSON.stringify({
+        semanticEvents: file.metadata.semanticEvents || [],
+        semanticCandidateHistory: file.metadata.semanticCandidateHistory || [],
+        candidateWindows: file.metadata.candidateWindows || [],
+        semanticTags: file.metadata.semanticTags || [],
+        indexTags: file.metadata.indexTags || [],
+        indexDescription: file.metadata.indexDescription,
+        recommendedForDraft: file.metadata.recommendedForDraft
+      });
+      file.metadata.semanticEvents = [];
+      file.metadata.semanticCandidateHistory = [];
+      file.metadata.candidateWindows = [];
+      file.metadata.semanticTags = [];
+      file.metadata.indexTags = [];
+      file.metadata.indexDescription = `Rejected by AI: ${reason}`;
+      file.metadata.recommendedForDraft = false;
+      const after = JSON.stringify({
+        semanticEvents: file.metadata.semanticEvents || [],
+        semanticCandidateHistory: file.metadata.semanticCandidateHistory || [],
+        candidateWindows: file.metadata.candidateWindows || [],
+        semanticTags: file.metadata.semanticTags || [],
+        indexTags: file.metadata.indexTags || [],
+        indexDescription: file.metadata.indexDescription,
+        recommendedForDraft: file.metadata.recommendedForDraft
+      });
+      if (before !== after) changed = true;
+    } else if (/^Rejected by AI:/i.test(String(file.metadata.indexDescription || "")) || file.metadata.recommendedForDraft === false) {
+      const before = JSON.stringify({
+        indexDescription: file.metadata.indexDescription,
+        recommendedForDraft: file.metadata.recommendedForDraft
+      });
+      file.metadata.indexDescription = file.metadata.semanticRejectReason
+        ? `Low confidence: ${file.metadata.semanticRejectReason}`
+        : file.metadata.indexDescription;
+      file.metadata.recommendedForDraft = true;
+      const after = JSON.stringify({
+        indexDescription: file.metadata.indexDescription,
+        recommendedForDraft: file.metadata.recommendedForDraft
+      });
+      if (before !== after) changed = true;
+    }
+  }
+  return changed;
+}
+
+function buildAiCoverageReport(project) {
+  normalizeAiDecisions(project);
+  const sourceFiles = (project.files || []).filter((file) => !looksLikePreviousExport(file.name));
+  const readyFiles = sourceFiles.filter((file) => Number(file.metadata?.duration || 0) > 0 && file.metadata?.videoCodec !== "pending");
+  const verifiedFiles = readyFiles.filter(hasVerifiedSemanticReview);
+  const autoUsableFiles = readyFiles.filter(hasAutoUsableHighlightCandidate);
+  const rejectedFiles = readyFiles.filter((file) => file.metadata?.aiDecision === "rejected" || hasBoringSemanticEvidence(file));
+  const highlightEligibleFiles = readyFiles.filter((file) => !rejectedFiles.includes(file));
+  const exhaustedFiles = readyFiles.filter((file) =>
+    !hasVerifiedSemanticReview(file) &&
+    Number(file.metadata?.semanticReviewAttemptVersion || 0) === SEMANTIC_REVIEW_VERSION &&
+    Number(file.metadata?.semanticReviewAttempts || 0) >= MAX_SEMANTIC_REVIEW_ATTEMPTS &&
+    !file.metadata?.semanticReviewLastError
+  );
+  const pendingFiles = readyFiles.filter((file) => needsSemanticPreprocess(file) || needsSemanticPreprocess(file, { refineReviewed: true }));
+  const percent = (count, total = readyFiles.length) => total ? Math.round((count / total) * 1000) / 10 : 0;
+  return {
+    projectId: project.id,
+    projectName: project.name,
+    targetRate: 95,
+    maxSemanticReviewAttempts: MAX_SEMANTIC_REVIEW_ATTEMPTS,
+    defaultMaxVisionCheckSeconds: DEFAULT_MAX_VISION_CHECK_SECONDS,
+    sourceVideos: sourceFiles.length,
+    readyVideos: readyFiles.length,
+    strictVerifiedVideos: verifiedFiles.length,
+    strictVerifiedRate: percent(verifiedFiles.length),
+    aiVerifiedVideos: autoUsableFiles.length,
+    aiVerifiedRate: percent(autoUsableFiles.length, readyFiles.length),
+    autoUsableVideos: autoUsableFiles.length,
+    autoUsableRate: percent(autoUsableFiles.length, readyFiles.length),
+    eligibleAiVerifiedRate: percent(autoUsableFiles.length, highlightEligibleFiles.length),
+    eligibleAutoUsableRate: percent(autoUsableFiles.length, highlightEligibleFiles.length),
+    highlightEligibleVideos: highlightEligibleFiles.length,
+    rejectedLowSignalVideos: rejectedFiles.length,
+    pendingReviewVideos: pendingFiles.length,
+    exhaustedUnverifiedVideos: exhaustedFiles.length,
+    missingAutoUsableVideos: readyFiles.length - autoUsableFiles.length,
+    attemptBreakdown: [0, 1, 2].map((attempts) => ({
+      attempts,
+      videos: readyFiles.filter((file) => semanticReviewAttempts(file) === attempts).length
+    })),
+    missingAutoUsableExamples: readyFiles
+      .filter((file) => !hasAutoUsableHighlightCandidate(file))
+      .slice(0, 12)
+      .map((file) => ({
+        id: file.id,
+        name: file.name,
+        semanticScore: Number(file.metadata?.semanticScore || 0),
+        indexScore: Number(file.metadata?.indexScore || 0),
+        attempts: semanticReviewAttempts(file),
+        reason: file.metadata?.semanticRejectReason || file.metadata?.semanticRating?.excludeReason || "No strong candidate evidence"
+      }))
+  };
+}
+
 app.post("/api/projects/:id/drafts", async (req, res, next) => {
   try {
     const project = await loadProject(req.params.id);
     const idea = req.body.idea;
+    const excludedIntervals = Array.isArray(idea.excludedIntervals) ? idea.excludedIntervals : [];
     const selectedIds = Array.isArray(idea.fileIds) ? [...new Set(idea.fileIds.map(String))] : [];
-    const draftFiles = selectedIds.length
+    const selectedDraftFiles = selectedIds.length
       ? project.files.filter((file) => selectedIds.includes(file.id))
       : project.files;
-    if (selectedIds.length && draftFiles.length !== selectedIds.length) {
+    if (selectedIds.length && selectedDraftFiles.length !== selectedIds.length) {
       return res.status(400).json({ error: structuredError("Some selected videos were not found", "The project changed before the draft was created.", "Refresh the project and try again.", true) });
+    }
+    const draftFiles = selectedDraftFiles.filter((file) => file.metadata?.aiDecision !== "rejected" && !hasBoringSemanticEvidence(file));
+    if (!draftFiles.length) {
+      return res.status(409).json({ error: structuredError("No highlight-ready clips selected", "The selected clips were rejected as low-signal footage.", "Choose confirmed clips or use I'm feeling lucky to pick a stronger mix.", true) });
     }
     const notReady = draftFiles.filter((file) => !hasUsableMetadata(file));
     if (notReady.length) {
@@ -779,20 +1267,16 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
       ? recommendTrailerDuration(draftFiles, idea.durationMode === "fixed" ? idea.duration : 0)
       : Math.min(MAX_DURATION, idea.duration);
     const planned = idea.style === "Trailer"
-      ? buildAgenticEditPlan(draftFiles, adaptiveDuration, {
+      ? buildAutoHighlightPlan(draftFiles, adaptiveDuration, {
           gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre,
-          requireVerifiedVision: true,
-          allowReviewCandidates: false,
-          qualityFirst: true
+          intensity: idea.intensity ?? 78,
+          excludedIntervals
         })
       : createSegments(draftFiles, adaptiveDuration, idea.intensity ?? 78);
-    const fallbackPlanned = planned.segments?.length
-      ? planned
-      : createAdviceFallbackPlan(draftFiles, adaptiveDuration, idea.intensity ?? 78, "AI did not find enough verified highlight events yet, so this draft uses indexed candidate moments.");
-    const { segments, duration } = fallbackPlanned;
+    const { segments, duration } = planned;
     const draft = {
       ...idea,
-      fileIds: selectedIds,
+      fileIds: draftFiles.map((file) => file.id),
       id: randomUUID(),
       duration,
       segments,
@@ -802,12 +1286,12 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
       intensity: idea.intensity ?? 78,
       changes: idea.style === "Trailer"
         ? [
-            "Director workflow ranked complete highlight moments",
-            "Boring and duplicate intervals were rejected",
-            "Pacing escalates toward verified payoff moments"
+            "Auto Highlight Ranker selected the strongest available moments",
+            "Verified moments are prioritized before uncertain candidates",
+            "Manual review is optional for improving low-confidence picks"
           ]
         : ["Real footage segments selected", "Professional style preset applied", "Audio normalized"],
-      workflow: fallbackPlanned.workflow,
+      workflow: planned.workflow,
       status: "ready"
     };
     project.drafts.push(draft);
@@ -1100,6 +1584,7 @@ app.post("/api/projects/:id/preprocess/run", async (req, res, next) => {
       sampleInterval: estimate.sampleInterval,
       maxFiles: Number(req.body.maxFiles) || 0,
       maxFrames: Number(req.body.maxFrames) || 0,
+      maxRuntimeSeconds: Math.max(30, Math.min(6 * 60 * 60, Number(req.body.maxRuntimeSeconds) || DEFAULT_MAX_VISION_CHECK_SECONDS)),
       refineReviewed: req.body.refineReviewed === true,
       fileIds: Array.isArray(req.body.fileIds) ? req.body.fileIds.map(String) : null,
       estimatedSeconds: estimate.estimatedSeconds,
@@ -1184,6 +1669,77 @@ app.patch("/api/projects/:projectId/drafts/:draftId", async (req, res, next) => 
     const index = project.drafts.findIndex((draft) => draft.id === req.params.draftId);
     if (index < 0) return res.status(404).json({ error: "Draft not found" });
     const current = project.drafts[index];
+    if (Array.isArray(req.body?.segments)) {
+      const fileById = new Map(project.files.map((file) => [file.id, file]));
+      const segments = req.body.segments.map((segment) => {
+        const file = fileById.get(String(segment.fileId || ""));
+        if (!file?.metadata?.duration) return null;
+        const fileDuration = Math.max(1, Number(file.metadata.duration) || 1);
+        const start = Math.max(0, Math.min(fileDuration - 1, Number(segment.start) || 0));
+        const duration = Math.max(1, Math.min(fileDuration - start, Number(segment.duration) || 0));
+        if (duration < 1) return null;
+        return {
+          fileId: file.id,
+          start: Math.round(start * 10) / 10,
+          duration: Math.round(duration * 10) / 10,
+          minDuration: Math.min(Math.round(duration * 10) / 10, Math.max(1, Number(segment.minDuration) || 1)),
+          score: Math.round(Number(segment.score) || Number(file.metadata.semanticScore) || Number(file.metadata.indexScore) || 70),
+          storyRole: String(segment.storyRole || "approved highlight"),
+          source: String(segment.source || "human-reviewed"),
+          confidence: ["high", "medium", "low"].includes(String(segment.confidence)) ? String(segment.confidence) : "high"
+        };
+      }).filter(Boolean);
+      if (!segments.length) {
+        return res.status(400).json({ error: structuredError(
+          "No approved video parts",
+          "Agree to at least one planned part before generating.",
+          "Review the planned cuts, approve the strong parts, then generate again.",
+          true
+        ) });
+      }
+      const duration = Math.round(segments.reduce((sum, segment) => sum + Math.max(0, Number(segment.duration) || 0), 0) * 10) / 10;
+      const explicitFileIds = [...new Set(segments.map((segment) => segment.fileId))];
+      const reviewedFileIds = new Set([
+        ...explicitFileIds,
+        ...(Array.isArray(req.body.reviewedFileIds) ? req.body.reviewedFileIds.map(String) : [])
+      ]);
+      const reviewedAt = new Date().toISOString();
+      for (const file of project.files) {
+        if (reviewedFileIds.has(file.id) && file.metadata) {
+          file.metadata.reviewed = true;
+          file.metadata.reviewedAt = reviewedAt;
+        }
+      }
+      const nextDraft = {
+        ...current,
+        ...req.body,
+        fileIds: explicitFileIds,
+        segments,
+        duration,
+        status: "ready",
+        version: Number(current.version || 1) + 1,
+        changes: Array.isArray(req.body.changes)
+          ? req.body.changes
+          : [...(current.changes || []), "User reviewed and approved planned cuts before rendering"],
+        workflow: {
+          ...(current.workflow || {}),
+          status: "user-reviewed",
+          stage: "user-reviewed",
+          selectedMoments: segments.length,
+          sourceVideosUsed: explicitFileIds.length,
+          requestedDuration: duration
+        }
+      };
+      delete nextDraft.exportUrl;
+      delete nextDraft.exportPath;
+      delete nextDraft.review;
+      delete nextDraft.encoding;
+      delete nextDraft.musicPlan;
+      delete nextDraft.musicDuration;
+      project.drafts[index] = nextDraft;
+      await saveProject(project);
+      return res.json(nextDraft);
+    }
     const selectedIds = new Set((current.fileIds || []).map(String));
     const draftFiles = selectedIds.size ? project.files.filter((file) => selectedIds.has(file.id)) : project.files;
     const nextDraft = refineDraftPlan(current, draftFiles, req.body);
@@ -1208,6 +1764,7 @@ app.post("/api/projects/:projectId/drafts/:draftId/render", async (req, res, nex
       draftId: draft.id,
       draftVersion: draft.version,
       assetId: req.body.assetId || null,
+      musicRepeats: Math.max(1, Math.min(2, Math.round(Number(req.body.musicRepeats) || 1))),
       status: "queued",
       phase: "queued",
       progress: 0,
@@ -1352,7 +1909,7 @@ app.use((error, _, res, __) => {
   if (error?.code === "ENOSPC") {
     return res.status(507).json({ error: structuredError("Not enough disk space", "HighlightAI could not finish copying the selected footage.", "Free disk space, then retry. Files copied before the error are preserved.", true, error.message) });
   }
-  res.status(500).json({ error: structuredError("Local processing error", error.message || "Unexpected local service error", "Retry the operation. If it repeats, open diagnostics and check the failed file.", true) });
+  res.status(500).json({ error: structuredError("Local processing error", "HighlightAI could not finish that step.", "Please try again. If it repeats, restart the app and run it again.", true, error?.message || String(error || "")) });
 });
 
 async function saveProject(project) {
@@ -1420,6 +1977,13 @@ function semanticMetadataSubset(metadata = {}) {
     "semanticTags",
     "semanticEvents",
     "semanticCandidateHistory",
+    "confirmedHighlightMoments",
+    "rejectedHighlightMoments",
+    "reviewed",
+    "reviewedAt",
+    "aiDecision",
+    "aiDecisionReason",
+    "aiDecisionUpdatedAt",
     "semanticFineReviewed",
     "semanticIndexJobId",
     "semanticReviewLastError"
@@ -1433,6 +1997,9 @@ function semanticMetadataSubset(metadata = {}) {
 }
 
 function semanticMetadataRank(metadata = {}) {
+  if (metadata.aiDecision === "confirmed" || metadata.aiDecision === "rejected") return 5;
+  if ((metadata.rejectedHighlightMoments || []).length > 0) return 5;
+  if ((metadata.confirmedHighlightMoments || []).length > 0) return 5;
   const attempts = Number(metadata.semanticReviewAttemptVersion || 0) === SEMANTIC_REVIEW_VERSION
     ? Number(metadata.semanticReviewAttempts || 0)
     : 0;
@@ -1455,11 +2022,72 @@ async function loadProject(id) {
   }
   const profileMissing = !project.gameProfile;
   if (profileMissing) project.gameProfile = inferGameProfile(project);
-  if (before !== after || profileMissing) {
+  const decisionsChanged = normalizeAiDecisions(project);
+  const reviewedFlagsChanged = migrateUserReviewedFlags(project);
+  const assetDurationsChanged = await migrateAudioAssetDurations(project);
+  if (before !== after || profileMissing || decisionsChanged || reviewedFlagsChanged || assetDurationsChanged) {
     project.analysis = buildAnalysis(project.files || []);
     await saveJson(projectFile(id), project);
   }
   return project;
+}
+
+async function migrateAudioAssetDurations(project) {
+  let changed = false;
+  for (const asset of project.assets || []) {
+    if (Number(asset.duration) > 0 || !isAudioAssetName(asset.name) || !asset.path) continue;
+    const duration = await audioAssetDuration(asset.path);
+    if (duration) {
+      asset.duration = duration;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function isAudioAssetName(name = "") {
+  return /\.(mp3|wav|m4a|aac|flac|ogg)$/i.test(String(name));
+}
+
+async function audioAssetDuration(filePath) {
+  try {
+    const info = await probe(filePath);
+    const duration = Number(info.duration) || 0;
+    return duration > 0 ? Math.round(duration * 10) / 10 : null;
+  } catch {
+    return null;
+  }
+}
+
+function migrateUserReviewedFlags(project) {
+  let changed = false;
+  for (const file of project.files || []) {
+    if (!file.metadata) continue;
+    const confirmed = Array.isArray(file.metadata.confirmedHighlightMoments)
+      ? file.metadata.confirmedHighlightMoments
+      : [];
+    const rejected = Array.isArray(file.metadata.rejectedHighlightMoments)
+      ? file.metadata.rejectedHighlightMoments
+      : [];
+    if (!confirmed.length && !rejected.length) continue;
+    if (file.metadata.reviewed !== true) {
+      file.metadata.reviewed = true;
+      changed = true;
+    }
+    if (!file.metadata.reviewedAt) {
+      file.metadata.reviewedAt = latestUserReviewTimestamp([...confirmed, ...rejected], project.updatedAt || project.createdAt);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function latestUserReviewTimestamp(items, fallback) {
+  const latest = items.reduce((max, item) => {
+    const value = Date.parse(item?.confirmedAt || item?.rejectedAt || item?.reviewedAt || item?.createdAt || "");
+    return Number.isFinite(value) && value > max ? value : max;
+  }, 0);
+  return latest ? new Date(latest).toISOString() : (fallback || new Date().toISOString());
 }
 
 function fileSha256(filePath) {
@@ -1650,6 +2278,12 @@ async function loadRenderJob(id) {
 
 function publicRenderJob(job) {
   const { assetId: _, reviewProvider: __, ...safe } = job;
+  safe.message = publicStatusMessage(safe.message, "Render is waiting.");
+  if (safe.error) safe.error = publicStructuredError(safe.error, {
+    title: "Rendering stopped",
+    message: "HighlightAI could not render this video.",
+    action: "Please try again. If it repeats, use fewer clips or a shorter music track, then render again."
+  });
   return safe;
 }
 
@@ -1680,7 +2314,11 @@ async function processRenderJob(id) {
   const outputPath = path.join(exportsRoot, outputName);
   const music = job.assetId ? project.assets.find((asset) => asset.id === job.assetId)?.path : null;
   const selectedIds = new Set((draft.fileIds || []).map(String));
-  const draftFiles = selectedIds.size ? project.files.filter((file) => selectedIds.has(file.id)) : project.files;
+  const selectedDraftFiles = selectedIds.size ? project.files.filter((file) => selectedIds.has(file.id)) : project.files;
+  const draftFiles = selectedDraftFiles.filter((file) => file.metadata?.aiDecision !== "rejected" && !hasHardRenderRejectEvidence(file));
+  if (!draftFiles.length) {
+    throw new Error("No usable highlight source clips were available for rendering.");
+  }
   const latestState = await loadRenderJob(id);
   if (controller.signal.aborted || !canStartBackgroundJob(latestState, ["queued", "processing"])) {
     activeRenderControllers.delete(id);
@@ -1697,26 +2335,43 @@ async function processRenderJob(id) {
   await saveRenderJob(job);
   let targetDuration = Number(draft.duration) || 90;
   let musicInfo = null;
+  const musicRepeats = Math.max(1, Math.min(2, Math.round(Number(job.musicRepeats || draft.musicRepeats || 1))));
   if (music) {
     musicInfo = await probe(music, controller.signal);
     if (musicInfo.duration > MAX_DURATION + 0.1) {
       throw new Error(`The selected soundtrack is ${Math.ceil(musicInfo.duration)} seconds. Choose a track no longer than ${MAX_DURATION} seconds so it can play without trimming.`);
     }
-    targetDuration = Math.max(30, musicInfo.duration);
+    targetDuration = Math.max(30, Math.min(MAX_DURATION, musicInfo.duration * musicRepeats));
   }
   let directed = null;
   const excludedIntervals = new Set();
   let visualReview = null;
   const reviewHistory = [];
   const visuallyApprovedIntervals = new Set();
-  for (let iteration = 1; iteration <= 4; iteration += 1) {
-    let candidatePlan = buildAgenticEditPlan(draftFiles, targetDuration, {
+  let finalReviewSourceSegments = [];
+  const lockedReviewedTimeline = isUserReviewedDraft(draft);
+  if (lockedReviewedTimeline) {
+    directed = buildUserReviewedPlan(draft, draftFiles, targetDuration);
+    if (!directed.segments.length) {
+      throw new Error("No approved highlight periods were saved for this reviewed draft.");
+    }
+    reviewHistory.push({
+      iteration: 1,
+      deterministicScore: directed.workflow.critique.score,
+      visualScore: directed.workflow.critique.score,
+      approved: true,
+      rejectedSegments: [],
+      trimmedSegments: 0,
+      problems: []
+    });
+  } else {
+    for (let iteration = 1; iteration <= 4; iteration += 1) {
+    let candidatePlan = buildAutoHighlightPlan(draftFiles, targetDuration, {
       minScore: 64,
+      relaxedMinScore: 58,
+      reviewCandidateMinScore: 64,
       excludedIntervals: [...excludedIntervals],
-      requireVerifiedVision: true,
-      allowReviewCandidates: Boolean(job.reviewProvider),
-      allowWeakReviewCandidates: false,
-      qualityFirst: true,
+      intensity: draft.intensity ?? 78,
       gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre
     });
     if (!candidatePlan.segments.length) {
@@ -1738,6 +2393,8 @@ async function processRenderJob(id) {
         workflow: { ...candidatePlan.workflow, reviewHistory, stage: "visual-review", iteration, maxIterations: 4 }
       });
       await saveRenderJob(job);
+      const originalSegments = [...candidatePlan.segments];
+      finalReviewSourceSegments = originalSegments;
       visualReview = await reviewPlannedTimelineWithModel({
         project,
         draft: { ...draft, ...candidatePlan },
@@ -1752,10 +2409,11 @@ async function processRenderJob(id) {
           score: 0,
           approved: false,
           rejectSegmentIndexes: [],
-          problems: [`Visual proxy review unavailable: ${error.message}`]
+          problems: [publicStatusMessage(error?.message, "Vision review was unavailable for this timeline.")]
         };
       });
       candidatePlan.workflow.visualReview = visualReview;
+      candidatePlan = applyVisualReviewEditsToDraft(candidatePlan, visualReview, { minSegmentDuration: 2.5 });
       reviewHistory.push({
         iteration,
         deterministicScore: candidatePlan.workflow.critique.score,
@@ -1763,6 +2421,7 @@ async function processRenderJob(id) {
         rawVisualScore: visualReview.rawScore ?? visualReview.score,
         approved: visualReview.approved,
         rejectedSegments: visualReview.rejectSegmentIndexes || [],
+        trimmedSegments: candidatePlan.workflow.visualReview?.trimmedSegments || 0,
         problems: visualReview.problems || []
       });
       Object.assign(job, {
@@ -1774,7 +2433,7 @@ async function processRenderJob(id) {
       await saveRenderJob(job);
       if (!directed || visualReview.score >= Number(directed.workflow.visualReview?.score || 0)) directed = candidatePlan;
       for (const index of visualReview.rejectSegmentIndexes || []) {
-        const segment = candidatePlan.segments[Number(index) - 1];
+        const segment = originalSegments[Number(index) - 1];
         if (segment) {
           const key = `${segment.fileId}:${Math.round(segment.start)}:${Math.round(segment.duration)}`;
           excludedIntervals.add(key);
@@ -1782,30 +2441,62 @@ async function processRenderJob(id) {
         }
       }
       for (const index of visualReview.approvedSegmentIndexes || []) {
-        const segment = candidatePlan.segments[Number(index) - 1];
+        const segment = originalSegments[Number(index) - 1];
         if (segment) visuallyApprovedIntervals.add(`${segment.fileId}:${Math.round(segment.start)}:${Math.round(segment.duration)}`);
       }
       if (visualReview.approved && candidatePlan.workflow.critique.approved) break;
     } else if (candidatePlan.workflow.critique.approved) break;
+    }
   }
-  if (job.reviewProvider && !directed?.workflow?.visualReview?.approved) {
+  if (!lockedReviewedTimeline && job.reviewProvider && !directed?.workflow?.visualReview?.approved) {
     const problems = directed?.workflow?.visualReview?.problems || [];
     job.workflow = { ...(directed?.workflow || job.workflow || {}), reviewHistory, stage: "visual-review", maxIterations: 4 };
     if (directed?.workflow) {
-      directed.workflow.status = "review-advice";
-      directed.workflow.advice = `Vision review did not approve this timeline. Generation continued anyway. ${problems.slice(0, 2).join(" ")}`.trim();
+      const publicProblems = problems.map((problem) => publicStatusMessage(problem, "Vision review could not confirm part of this timeline."));
+      directed.workflow.status = "review-revised";
+      directed.workflow.advice = `Final review revised the timeline before rendering. ${publicProblems.slice(0, 2).join(" ")}`.trim();
     }
     await saveRenderJob(job);
   }
   const rejectedIndexes = new Set((directed.workflow.visualReview?.rejectSegmentIndexes || []).map((index) => Number(index) - 1));
-  if (rejectedIndexes.size) {
+  if (rejectedIndexes.size && directed.workflow.visualReviewEditsApplied !== true) {
     directed.segments = directed.segments.filter((_, index) => !rejectedIndexes.has(index));
     directed.duration = Math.round(directed.segments.reduce((sum, segment) => sum + segment.duration, 0) * 10) / 10;
     directed.workflow.selectedMoments = directed.segments.length;
     directed.workflow.status = "revised";
   }
+  if (!lockedReviewedTimeline) {
+    directed = polishFinalTimeline(directed, draftFiles, targetDuration, {
+      minScore: 64,
+      relaxedMinScore: 58,
+      reviewCandidateMinScore: 64,
+      gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre,
+      excludedIntervals: [...excludedIntervals]
+    });
+    if (job.reviewProvider) {
+      directed.workflow = {
+        ...(directed.workflow || {}),
+        stage: "final-polish",
+        advice: "Final review polished the timeline automatically. Weak shots were trimmed or replaced before rendering.",
+        reviewHistory
+      };
+    }
+  }
   if (!directed.segments.length) {
-    directed = createAdviceFallbackPlan(draftFiles, targetDuration, draft.intensity ?? 78, "The visual review rejected every proposed shot, so render continued with the best available local source moments.");
+    directed = polishFinalTimeline(
+      createAdviceFallbackPlan(draftFiles, targetDuration, draft.intensity ?? 78, "Final review found weak shots, so the editor rebuilt the timeline from the strongest available local moments."),
+      draftFiles,
+      targetDuration,
+      {
+        minScore: 58,
+        relaxedMinScore: 52,
+        reviewCandidateMinScore: 58,
+        gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre
+      }
+    );
+  }
+  if (!directed.segments.length) {
+    throw new Error("No usable highlight moments were available for rendering.");
   }
   Object.assign(draft, directed);
   draft.workflow = { ...(draft.workflow || {}), reviewHistory };
@@ -1819,16 +2510,36 @@ async function processRenderJob(id) {
   Object.assign(job, { phase: "aligning", progress: 13, message: "Music director is aligning cuts and the final ending" });
   await saveRenderJob(job);
   if (musicInfo) {
-    const maxOutro = maxLogoOutroDuration(musicInfo.duration);
+    const requestedMusicDuration = Math.min(MAX_DURATION, musicInfo.duration * musicRepeats);
+    const maxOutro = maxLogoOutroDuration(requestedMusicDuration);
     const beforeExtension = (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
-    const extendedDraft = extendDraftToMusicDuration(draft, draftFiles, musicInfo.duration, {
+    const extendedDraft = extendDraftToMusicDuration({ ...draft, musicRepeats }, draftFiles, requestedMusicDuration, {
       maxLogoOutroDuration: maxOutro,
       intensity: draft.intensity ?? 78,
-      gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre
+      gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre,
+      lockReviewedCuts: lockedReviewedTimeline,
+      lockExistingCuts: Boolean(job.reviewProvider)
     });
     Object.assign(draft, extendedDraft);
     directed.workflow = draft.workflow;
     const afterExtension = (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+    const musicExtension = draft.workflow?.musicExtension || {};
+    if (!lockedReviewedTimeline && job.reviewProvider && musicExtension.lockExistingCuts === true && Number(musicExtension.targetContentDuration || 0) - Number(musicExtension.contentDuration || 0) > 12) {
+      draft.workflow = {
+        ...(draft.workflow || {}),
+        status: "short-polished-timeline",
+        advice: "The editor kept reviewed cut boundaries and rendered a shorter, cleaner timeline instead of adding weak filler.",
+        reviewHistory,
+        stage: "music-advice"
+      };
+      Object.assign(job, {
+        phase: "aligning",
+        progress: 14,
+        message: "Music director kept the polished cuts instead of adding weak filler",
+        workflow: { ...draft.workflow, reviewHistory, stage: "music-advice" }
+      });
+      await saveRenderJob(job);
+    }
     if (afterExtension > beforeExtension + 0.5) {
       draft.workflow = {
         ...(draft.workflow || {}),
@@ -1846,7 +2557,60 @@ async function processRenderJob(id) {
       await saveRenderJob(job);
     }
   }
-  const alignedDraft = await alignTrailerSegmentsToMusic(draft, music);
+  draft.musicRepeats = musicRepeats;
+  if (lockedReviewedTimeline && musicInfo) {
+    const availableMusic = Math.min(MAX_DURATION, musicInfo.duration * musicRepeats);
+    const reviewedContentBudget = Math.max(1, availableMusic - maxLogoOutroDuration(availableMusic));
+    const beforeFit = (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+    const fittedDraft = fitTimelineToDuration(draft, reviewedContentBudget, {
+      minSegmentDuration: 2.5,
+      maxSourceUses: 1,
+      mode: "reviewed-music-fit"
+    });
+    Object.assign(draft, fittedDraft);
+    const afterFit = (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+    if (afterFit < beforeFit - 0.5) {
+      draft.workflow = {
+        ...(draft.workflow || {}),
+        status: "reviewed-music-fit",
+        advice: "The final editor fit the reviewed highlights to the soundtrack so the video and music end together.",
+        reviewHistory,
+        stage: "music-fit"
+      };
+      Object.assign(job, {
+        phase: "aligning",
+        progress: 15,
+        message: "Music director fit the reviewed cuts to the soundtrack",
+        workflow: { ...draft.workflow, reviewHistory, stage: "music-fit" }
+      });
+      await saveRenderJob(job);
+    }
+  }
+  const alignedDraft = lockedReviewedTimeline && musicInfo
+    ? {
+        ...draft,
+        duration: Math.round(Math.min(
+          Math.min(MAX_DURATION, musicInfo.duration * musicRepeats),
+          (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) + maxLogoOutroDuration(musicInfo.duration * musicRepeats)
+        ) * 10) / 10,
+        contentDuration: Math.round((draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) * 10) / 10,
+        outroDuration: Math.max(0, Math.round((Math.min(Math.min(MAX_DURATION, musicInfo.duration * musicRepeats), (draft.duration || 0) + maxLogoOutroDuration(musicInfo.duration * musicRepeats)) - (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0)) * 10) / 10),
+        musicDuration: Math.round(musicInfo.duration * 10) / 10,
+        musicRepeats,
+        musicPlan: {
+          sourceDuration: Math.round(musicInfo.duration * 10) / 10,
+          contentDuration: Math.round((draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) * 10) / 10,
+          timelineDuration: Math.round(Math.min(
+            Math.min(MAX_DURATION, musicInfo.duration * musicRepeats),
+            (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0) + maxLogoOutroDuration(musicInfo.duration * musicRepeats)
+          ) * 10) / 10,
+          outroDuration: Math.max(0, Math.round(((Number(draft.duration) || 0) - (draft.segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0)) * 10) / 10),
+          repeats: musicRepeats,
+          ending: "reviewed cuts with soundtrack ending",
+          syncPoints: 0
+        }
+      }
+    : await alignTrailerSegmentsToMusic(draft, music);
   const maximumOutro = maxLogoOutroDuration(alignedDraft.musicDuration || 0);
   if (Number(alignedDraft.outroDuration || 0) > maximumOutro) {
     directed.workflow = {
@@ -1978,7 +2742,13 @@ async function markRenderJobFailed(id, error) {
     job.status = "failed";
     job.phase = "failed";
     job.message = "Rendering failed";
-    job.error = structuredError("Rendering stopped", error.message || "FFmpeg could not complete the video.", "You can keep using the app and retry this draft.", true);
+    job.error = structuredError(
+      "Rendering stopped",
+      "HighlightAI could not render this video.",
+      "Please try again. If it repeats, use fewer clips or a shorter music track, then render again.",
+      true,
+      error instanceof Error ? error.message : String(error || "")
+    );
     await saveRenderJob(job);
     const project = await loadProject(job.projectId);
     const draft = project.drafts.find((item) => item.id === job.draftId);
@@ -2156,6 +2926,10 @@ async function recoverInterruptedFastIndexJobs() {
 
 function publicPreprocessJob(job) {
   const { endpoint: _, cancelRequested: __, ...safe } = job;
+  safe.failures = (safe.failures || []).map((failure) => ({
+    ...failure,
+    message: publicStatusMessage(failure.message, "Vision AI could not review this item.")
+  }));
   safe.totalFiles = Math.max(Number(safe.totalFiles || 0), Number(safe.processedFiles || 0));
   safe.totalRequests = Math.max(Number(safe.totalRequests || 0), Number(safe.processedRequests || 0));
   if (["completed", "completed_with_warnings", "failed", "cancelled"].includes(String(safe.status || ""))) {
@@ -2172,6 +2946,10 @@ function publicPreprocessJob(job) {
 
 function publicFastIndexJob(job) {
   const { files: _, cancelRequested: __, ...safe } = job;
+  safe.failures = (safe.failures || []).map((failure) => ({
+    ...failure,
+    message: publicStatusMessage(failure.message, "HighlightAI could not index this item.")
+  }));
   const counts = normalizeFastIndexProgressFields(safe);
   safe.totalFiles = counts.totalFiles;
   safe.processedFiles = counts.processedFiles;
@@ -2214,6 +2992,28 @@ async function markFastIndexJobFailed(id, error) {
   } catch (saveError) {
     console.error(saveError);
   }
+}
+
+function hasBackendDetails(value = "") {
+  return /(?:ffmpeg|ffprobe|libx264|libx265|encoder|decoder|stderr|stdout|exited\s+-?\d+|error code|invalid argument|conversion failed|malloc|0x[0-9a-f]+|\[[a-z0-9#:@/.-]+]|(?:[A-Z]:\\|\/(?:Users|tmp|var|home|mnt|usr|app)\/)|node_modules|stack trace|traceback|errno|syscall|EADDRINUSE|ECONN|ENOTFOUND|EAI_AGAIN|https?:\/\/|api[_ -]?key|authorization|bearer|token|secret|password|sk-[a-z0-9_-]+|\b(?:TypeError|ReferenceError|SyntaxError)\b)/i.test(String(value || ""));
+}
+
+function unsafePublicMessage(value = "") {
+  const text = String(value || "");
+  return !text.trim() || text.length > 240 || /[\r\n]/.test(text) || hasBackendDetails(text);
+}
+
+function publicStatusMessage(value, fallback) {
+  return unsafePublicMessage(value) ? fallback : String(value);
+}
+
+function publicStructuredError(error = {}, fallback = {}) {
+  return {
+    title: publicStatusMessage(error.title, fallback.title || "Processing stopped"),
+    message: publicStatusMessage(error.message, fallback.message || "HighlightAI could not finish that step."),
+    action: publicStatusMessage(error.action, fallback.action || "Please try again."),
+    recoverable: error.recoverable !== false
+  };
 }
 
 function structuredError(title, message, action, recoverable, details) {
@@ -2757,15 +3557,17 @@ function formatTimestamp(seconds) {
 function buildAnalysis(files) {
   calibrateHighlightScores(files);
   const readyFiles = files.filter((file) => hasUsableMetadata(file));
-  const analysisFiles = readyFiles.length ? readyFiles : files;
+  const highlightFiles = readyFiles.filter((file) => file.metadata?.aiDecision !== "rejected" && !hasBoringSemanticEvidence(file));
+  const analysisFiles = highlightFiles.length ? highlightFiles : readyFiles.length ? readyFiles : files;
   const pendingFiles = files.length - readyFiles.length;
-  const aiRated = readyFiles.filter((file) => Number.isFinite(file.metadata?.semanticScore));
+  const aiRated = analysisFiles.filter((file) => Number.isFinite(file.metadata?.semanticScore));
   const weightedQuality = aiRated.length
     ? Math.round(aiRated.reduce((sum, file) => sum + file.metadata.semanticScore, 0) / aiRated.length)
-    : Math.round(readyFiles.reduce((sum, file) => sum + (file.metadata?.qualityScore || 0), 0) / Math.max(1, readyFiles.length));
-  const totalDuration = readyFiles.reduce((sum, file) => sum + (file.metadata?.duration || 0), 0);
-  const moments = readyFiles.length ? Math.max(3, Math.min(40, Math.round(totalDuration / 18))) : 0;
-  const semanticEvents = readyFiles.reduce((sum, file) => sum + (file.metadata?.semanticEvents || []).length, 0);
+    : Math.round(analysisFiles.reduce((sum, file) => sum + (file.metadata?.qualityScore || 0), 0) / Math.max(1, analysisFiles.length));
+  const totalDuration = analysisFiles.reduce((sum, file) => sum + (file.metadata?.duration || 0), 0);
+  const moments = analysisFiles.length ? Math.max(3, Math.min(40, Math.round(totalDuration / 18))) : 0;
+  const semanticEvents = analysisFiles.reduce((sum, file) => sum + (file.metadata?.semanticEvents || []).length, 0);
+  const rejectedCount = readyFiles.length - highlightFiles.length;
   return {
     qualityScore: weightedQuality,
     actionMoments: semanticEvents || moments,
@@ -2776,9 +3578,13 @@ function buildAnalysis(files) {
         ? `${files.length} videos found. ${readyFiles.length} analyzed, ${pendingFiles} still running in the background.`
         : semanticEvents
         ? `${semanticEvents} AI-rated action event${semanticEvents === 1 ? "" : "s"} found across ${aiRated.length} recording${aiRated.length === 1 ? "" : "s"}.`
-        : `${moments} potential highlight segments found across ${readyFiles.length} analyzed recording${readyFiles.length === 1 ? "" : "s"}.`,
+        : `${moments} potential highlight segments found across ${analysisFiles.length} highlight-ready recording${analysisFiles.length === 1 ? "" : "s"}.`,
       readyFiles.length && readyFiles.every((file) => file.metadata?.hasAudio) ? "All analyzed recordings have usable audio." : "Some recordings have no audio or are still being analyzed.",
-      pendingFiles ? "You can browse the folder now. Trailer creation unlocks when selected videos are analyzed." : "A focused highlight under 5 minutes will produce the strongest result."
+      pendingFiles
+        ? "You can browse the folder now. Trailer creation unlocks when selected videos are analyzed."
+        : rejectedCount
+          ? `${rejectedCount} low-signal clip${rejectedCount === 1 ? "" : "s"} were excluded from highlight generation.`
+          : "A focused highlight under 5 minutes will produce the strongest result."
     ],
     files: files.map(({ path: _, ...file }) => file),
     ideas: buildIdeas(analysisFiles, totalDuration, moments, weightedQuality)
@@ -2907,9 +3713,14 @@ function hasVerifiedSemanticReview(file) {
   const strongVisionScore = metadata.visionApproved === true && Number(metadata.visionScore || 0) >= 70;
   const strongSemanticScore = Number(metadata.semanticScore || 0) >= 70
     && (metadata.ratingSource === "vision-ai" || metadata.ratingConfidence === "high");
+  const strongSummaryPayoff = metadata.semanticTraits?.payoffVerified === true
+    && Number(metadata.semanticScore || 0) >= 70
+    && Number(metadata.semanticRating?.trailerUsefulness || 0) >= 70
+    && String(metadata.semanticRating?.excludeReason || "none").toLowerCase() === "none";
   return metadata.semanticQuality === "verified"
     || strongVisionScore
     || strongSemanticScore
+    || strongSummaryPayoff
     || (metadata.semanticEvents || []).some((event) => event?.payoffVerified === true);
 }
 
@@ -2931,11 +3742,16 @@ function needsSemanticPreprocess(file, options = {}) {
 
 function hasPotentialSemanticTimeline(file) {
   const metadata = file?.metadata || {};
+  const overlapsRejected = (event) => (metadata.rejectedHighlightMoments || []).some((item) =>
+    item?.reason === "not-highlight" &&
+    Math.max(Number(item.start) || 0, Number(event?.start) || 0) < Math.min(Number(item.end) || (Number(item.start) || 0) + (Number(item.duration) || 0), Number(event?.end) || (Number(event?.start) || 0) + (Number(event?.duration) || 0)) - 0.75
+  );
   return [
     ...(metadata.semanticEvents || []),
     ...(metadata.semanticCandidateHistory || []),
     ...(metadata.candidateWindows || [])
   ].some((event) =>
+    !overlapsRejected(event) &&
     Number.isFinite(Number(event?.start)) &&
     Number.isFinite(Number(event?.end)) &&
     Number(event.end) > Number(event.start)
@@ -3062,9 +3878,14 @@ function denseCandidateFrameTimes(file, budget = 18, minimumReturned = 8) {
 function candidateReviewWindows(file) {
   const duration = Math.max(0, Number(file.metadata?.duration) || 0);
   const windows = [];
+  const overlapsRejected = (start, end) => (file.metadata?.rejectedHighlightMoments || []).some((item) =>
+    item?.reason === "not-highlight" &&
+    Math.max(Number(item.start) || 0, start) < Math.min(Number(item.end) || (Number(item.start) || 0) + (Number(item.duration) || 0), end) - 0.75
+  );
   for (const window of file.metadata?.candidateWindows || []) {
     const start = Math.max(0, Number(window.start) || 0);
     const end = Math.min(duration, Number(window.end) || start + Number(window.duration) || start + 8);
+    if (overlapsRejected(start, end)) continue;
     windows.push({
       start,
       end,
@@ -3076,6 +3897,7 @@ function candidateReviewWindows(file) {
   for (const event of [...(file.metadata?.semanticEvents || []), ...(file.metadata?.semanticCandidateHistory || [])]) {
     const start = Math.max(0, Number(event.start) || 0);
     const end = Math.min(duration, Number(event.end) || start + 8);
+    if (overlapsRejected(start, end)) continue;
     windows.push({
       start,
       end,
@@ -3212,9 +4034,12 @@ async function processPreprocessJobWork(id, signal) {
   project.gameProfile = project.gameProfile || inferGameProfile(project);
   const batches = buildPreprocessBatches(selectedFiles, job.sampleInterval, job.maxFrames, job);
   const started = Date.now();
+  const maxRuntimeMs = Math.max(30, Number(job.maxRuntimeSeconds || DEFAULT_MAX_VISION_CHECK_SECONDS)) * 1000;
+  const deadline = started + maxRuntimeMs;
   const baselineProcessedRequests = Number(job.processedRequests || 0);
   const active = new Set();
   let cursor = 0;
+  let timeLimitHit = false;
   let processedFrames = Number(job.processedFrames || 0);
   let processedRequests = Number(job.processedRequests || 0);
   let approvedFrames = Number(job.approvedFrames || 0);
@@ -3291,6 +4116,7 @@ async function processPreprocessJobWork(id, signal) {
       processedFiles += 1;
       eventsFound += summary.events.length;
     }
+    normalizeAiDecisions(project);
     project.analysis = buildAnalysis(project.files);
     project.gameProfile = refineGameProfile(project.gameProfile, project.files);
     await saveProject(project);
@@ -3298,6 +4124,10 @@ async function processPreprocessJobWork(id, signal) {
 
   const worker = async () => {
     while (cursor < batches.length && !signal.aborted) {
+      if (Date.now() >= deadline) {
+        timeLimitHit = true;
+        break;
+      }
       const batch = batches[cursor++];
       for (const item of batch.items) active.add(item.file.name);
       const first = batch.items[0];
@@ -3384,6 +4214,13 @@ async function processPreprocessJobWork(id, signal) {
   await Promise.all(Array.from({ length: Math.min(job.concurrency, batches.length) }, () => worker()));
   const current = await loadPreprocessJob(id);
   if (current.cancelRequested || signal.aborted) return;
+  if (timeLimitHit || processedRequests < current.totalRequests) {
+    current.failures = [...(current.failures || []), {
+      name: "Vision AI time limit",
+      phase: "vision",
+      message: `Vision AI reached the ${Math.round(maxRuntimeMs / 1000)} second check limit. Saved completed reviews and stopped safely.`
+    }];
+  }
   current.status = current.failures.length ? "completed_with_warnings" : "completed";
   current.phase = "completed";
   current.processedFiles = processedFiles;
@@ -3517,6 +4354,7 @@ async function reviewPlannedTimelineWithModel({ project, draft, endpoint, apiKey
     const scores = [];
     const rawScores = [];
     const approvedIndexes = new Set();
+    const trimEdits = [];
     for (let offset = 0; offset < pendingSegments.length; offset += 3) {
       const group = pendingSegments.slice(offset, offset + 3);
       const tiles = [];
@@ -3556,13 +4394,15 @@ async function reviewPlannedTimelineWithModel({ project, draft, endpoint, apiKey
         `The rows in this sheet are global shot numbers ${group.map((item) => item.index + 1).join(", ")}. Return those exact global numbers as segmentIndex.`,
         `Expected event labels are hints, not proof: ${expectedActions.join("; ")}.`,
         "Judge every row independently. Adjacent rows are different source shots, so do not reject one because it does not continue the other.",
-        "Reject a row if it shows irrelevant interface screens, loading, inactivity, obstruction, repetition, or setup whose visible payoff is missing by the last frame.",
+        "Reject a row if it shows irrelevant interface screens, loading, inactivity, death state, long walking/travel, obstruction, repetition, or setup whose visible payoff is missing by the last frame.",
+        "If only the lead-in or tail is boring but the row contains a usable payoff, approve the row and return a trim edit with absolute source timestamps. Trim walking, death screens, menus, waiting, and boring tails out of the kept range.",
         `Detected game type: ${gameProfile.label} (${gameProfile.genre}).`,
         downtimeGuidance(gameProfile),
         payoffGuidance(gameProfile),
         "Do not require military combat outcomes in non-military games. Judge completion using the detected game's own objectives and audience expectations.",
         "Return JSON only:",
-        "{\"score\":0-100,\"segments\":[{\"segmentIndex\":1,\"approved\":boolean,\"payoffVerified\":boolean,\"boring\":boolean,\"reason\":\"specific visible evidence\"}],\"problems\":[\"specific visible problem\"]}.",
+        "{\"score\":0-100,\"segments\":[{\"segmentIndex\":1,\"approved\":boolean,\"payoffVerified\":boolean,\"boring\":boolean,\"reason\":\"specific visible evidence\",\"trimStart\":0,\"trimEnd\":0}],\"trimSegmentEdits\":[{\"segmentIndex\":1,\"start\":0,\"end\":0,\"reason\":\"what was trimmed\"}],\"problems\":[\"specific visible problem\"]}.",
+        "Use trimStart/trimEnd and trimSegmentEdits only as absolute source-video timestamps inside that shot's shown range. Omit trim values when no trim is needed.",
         "Do not return placeholder words such as short, reason, or problem. The reason must name concrete visible evidence from this shot.",
         "Approval-quality footage needs readable action, escalation, a completed payoff, and no boring interface or traversal frames.",
         "Keep the decision internally consistent: a fully approved professional-quality shot should score 90-100; any shot below that standard must be rejected with specific visible evidence."
@@ -3606,8 +4446,37 @@ async function reviewPlannedTimelineWithModel({ project, draft, endpoint, apiKey
         if (!Number.isInteger(index) || index < 1 || index > segments.length) continue;
         if (!item.approved || item.boring || item.payoffVerified === false) rejected.add(index);
         else approvedIndexes.add(index);
+        const trimStart = Number(item.trimStart);
+        const trimEnd = Number(item.trimEnd);
+        if (Number.isFinite(trimStart) || Number.isFinite(trimEnd)) {
+          const segment = segments[index - 1];
+          const start = Number.isFinite(trimStart) ? trimStart : Number(segment.start) || 0;
+          const end = Number.isFinite(trimEnd) ? trimEnd : (Number(segment.start) || 0) + (Number(segment.duration) || 0);
+          if (end > start) {
+            trimEdits.push({
+              segmentIndex: index,
+              start,
+              end,
+              reason: String(item.reason || "Final review trimmed this shot.").slice(0, 150)
+            });
+          }
+        }
         if (item.reason && (!item.approved || item.boring || item.payoffVerified === false)) {
           problems.push(`Shot ${index}: ${String(item.reason).slice(0, 150)}`);
+        }
+      }
+      for (const item of Array.isArray(parsed.trimSegmentEdits) ? parsed.trimSegmentEdits : []) {
+        const index = Number(item.segmentIndex);
+        if (!Number.isInteger(index) || index < 1 || index > segments.length) continue;
+        const start = Number(item.start ?? item.trimStart ?? item.keepStart);
+        const end = Number(item.end ?? item.trimEnd ?? item.keepEnd);
+        if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+          trimEdits.push({
+            segmentIndex: index,
+            start,
+            end,
+            reason: String(item.reason || "Final review trimmed boring footage.").slice(0, 150)
+          });
         }
       }
       for (const problem of Array.isArray(parsed.problems) ? parsed.problems : []) {
@@ -3626,6 +4495,7 @@ async function reviewPlannedTimelineWithModel({ project, draft, endpoint, apiKey
       approved: score >= 90 && rejected.size === 0,
       rejectSegmentIndexes: [...rejected].slice(0, 12),
       approvedSegmentIndexes: [...approvedIndexes],
+      trimSegmentEdits: trimEdits.slice(0, 12),
       problems: problems.slice(0, 12)
     };
   } finally {

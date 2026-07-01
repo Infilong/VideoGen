@@ -252,10 +252,14 @@ export interface MediaMetadata {
   rejectedHighlightMoments?: Array<{ start: number; end: number; duration: number; reason: "not-highlight"; source?: string; rejectedAt: string }>;
   reviewed?: boolean;
   reviewedAt?: string;
+  generationUseCount?: number;
+  generationLastUsedAt?: string;
   semanticFineReviewed?: boolean;
   semanticIndexJobId?: string;
   semanticReviewLastError?: string | null;
   aiDecision?: "confirmed" | "low_confidence" | "rejected" | "pending";
+  aiDecisionOverride?: "include";
+  aiDecisionOverrideReason?: string;
   aiDecisionReason?: string;
   aiDecisionUpdatedAt?: string;
   visionApproved?: boolean;

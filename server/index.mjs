@@ -909,7 +909,10 @@ function buildAutoHighlightPlan(files, targetDuration, options = {}) {
     requireVerifiedVision: true,
     allowReviewCandidates: false
   });
-  if (strictPlan.segments?.length && (strictPlan.workflow?.critique?.approved || strictPlan.segments.length >= 3)) {
+  const targetSeconds = Math.min(MAX_DURATION, Math.max(45, Number(targetDuration) || 180));
+  const strictDuration = Number(strictPlan.duration || 0);
+  const strictHasEnoughCoverage = strictDuration >= targetSeconds * 0.9;
+  if (strictPlan.segments?.length && strictHasEnoughCoverage && (strictPlan.workflow?.critique?.approved || strictPlan.segments.length >= 3)) {
     strictPlan.workflow.status = "verified-ai";
     strictPlan.workflow.advice = "AI verified enough complete highlight moments for automatic generation.";
     return strictPlan;
@@ -927,9 +930,19 @@ function buildAutoHighlightPlan(files, targetDuration, options = {}) {
     qualityFirst: false
   });
   if (autoRankedPlan.segments?.length) {
+    const autoDuration = Number(autoRankedPlan.duration || 0);
+    const shouldUseStrict = strictPlan.segments?.length && strictDuration >= autoDuration && strictDuration >= targetSeconds * 0.75;
+    if (shouldUseStrict) {
+      strictPlan.workflow.status = "verified-ai";
+      strictPlan.workflow.advice = "AI verified the strongest complete highlight moments for automatic generation.";
+      return strictPlan;
+    }
     autoRankedPlan.workflow.status = strictPlan.segments?.length ? "verified-plus-auto-ranked" : "auto-ranked-candidates";
-    autoRankedPlan.workflow.advice = "AI used verified moments first, then auto-ranked strong uncertain and indexed candidates without requiring manual review.";
+    autoRankedPlan.workflow.advice = strictPlan.segments?.length && !strictHasEnoughCoverage
+      ? "AI verified strong moments, then added ranked supporting clips to get closer to the requested three-minute edit."
+      : "AI used verified moments first, then auto-ranked strong uncertain and indexed candidates without requiring manual review.";
     autoRankedPlan.workflow.strictCandidateCount = strictPlan.segments?.length || 0;
+    autoRankedPlan.workflow.strictCandidateDuration = Math.round(strictDuration * 10) / 10;
     return autoRankedPlan;
   }
 
@@ -1057,6 +1070,27 @@ function hasHardRenderRejectEvidence(file) {
   const hardRejects = new Set(["menu", "scoreboard", "map", "loading", "death", "walking", "waiting", "weak_aim", "unreadable", "duplicate"]);
   return reject.split(/[^a-z_]+/).some((part) => hardRejects.has(part)) ||
     /\b(menu|scoreboard|loading|map|death|walking|waiting|weak aim|unreadable|duplicate)\b/i.test(reason);
+}
+
+function hasUserAiOverride(file, overrideIds = new Set()) {
+  return Boolean(file) && (overrideIds.has(String(file.id)) || file.metadata?.aiDecisionOverride === "include");
+}
+
+function withUserAiOverride(file, overrideIds = new Set()) {
+  if (!hasUserAiOverride(file, overrideIds) || file.metadata?.aiDecision !== "rejected") return file;
+  return {
+    ...file,
+    metadata: {
+      ...file.metadata,
+      aiDecisionOverride: "include",
+      aiDecisionOverrideReason: "User selected this AI-flagged clip for generation."
+    }
+  };
+}
+
+function isGenerationEligibleFile(file, overrideIds = new Set()) {
+  if (hasUserAiOverride(file, overrideIds)) return !hasHardRenderRejectEvidence(file);
+  return file?.metadata?.aiDecision !== "rejected" && !hasBoringSemanticEvidence(file);
 }
 
 function hasRecoverableGameplaySignal(file) {
@@ -1255,28 +1289,32 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
     if (selectedIds.length && selectedDraftFiles.length !== selectedIds.length) {
       return res.status(400).json({ error: structuredError("Some selected videos were not found", "The project changed before the draft was created.", "Refresh the project and try again.", true) });
     }
-    const draftFiles = selectedDraftFiles.filter((file) => file.metadata?.aiDecision !== "rejected" && !hasBoringSemanticEvidence(file));
+    const userOverrideIds = new Set(selectedIds);
+    const draftFiles = selectedDraftFiles.filter((file) => isGenerationEligibleFile(file, userOverrideIds));
     if (!draftFiles.length) {
-      return res.status(409).json({ error: structuredError("No highlight-ready clips selected", "The selected clips were rejected as low-signal footage.", "Choose confirmed clips or use I'm feeling lucky to pick a stronger mix.", true) });
+      return res.status(409).json({ error: structuredError("No usable clips selected", "The selected clips have hard reject evidence such as menu, loading, death screen, unreadable footage, or duplicate exports.", "Choose different clips, or review the flagged clip and confirm a specific highlight period.", true) });
     }
     const notReady = draftFiles.filter((file) => !hasUsableMetadata(file));
     if (notReady.length) {
       return res.status(409).json({ error: structuredError("Videos are still being analyzed", `${notReady.length} selected video${notReady.length === 1 ? " is" : "s are"} not ready yet.`, "Wait for background folder analysis to finish, then create the trailer.", true) });
     }
+    const planningFiles = draftFiles.map((file) => withUserAiOverride(file, userOverrideIds));
+    const overriddenRejectedFiles = draftFiles.filter((file) => userOverrideIds.has(String(file.id)) && file.metadata?.aiDecision === "rejected");
     const adaptiveDuration = idea.style === "Trailer"
-      ? recommendTrailerDuration(draftFiles, idea.durationMode === "fixed" ? idea.duration : 0)
+      ? recommendTrailerDuration(planningFiles, idea.durationMode === "fixed" ? idea.duration : 0)
       : Math.min(MAX_DURATION, idea.duration);
     const planned = idea.style === "Trailer"
-      ? buildAutoHighlightPlan(draftFiles, adaptiveDuration, {
+      ? buildAutoHighlightPlan(planningFiles, adaptiveDuration, {
           gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre,
           intensity: idea.intensity ?? 78,
           excludedIntervals
         })
-      : createSegments(draftFiles, adaptiveDuration, idea.intensity ?? 78);
+      : createSegments(planningFiles, adaptiveDuration, idea.intensity ?? 78);
     const { segments, duration } = planned;
     const draft = {
       ...idea,
       fileIds: draftFiles.map((file) => file.id),
+      ...(overriddenRejectedFiles.length ? { userOverrideFileIds: overriddenRejectedFiles.map((file) => file.id) } : {}),
       id: randomUUID(),
       duration,
       segments,
@@ -1288,9 +1326,10 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
         ? [
             "Auto Highlight Ranker selected the strongest available moments",
             "Verified moments are prioritized before uncertain candidates",
-            "Manual review is optional for improving low-confidence picks"
+            "Manual review is optional for improving low-confidence picks",
+            ...(overriddenRejectedFiles.length ? [`User overrode AI red flags for ${overriddenRejectedFiles.length} selected clip${overriddenRejectedFiles.length === 1 ? "" : "s"}`] : [])
           ]
-        : ["Real footage segments selected", "Professional style preset applied", "Audio normalized"],
+        : ["Real footage segments selected", "Professional style preset applied", "Audio normalized", ...(overriddenRejectedFiles.length ? [`User overrode AI red flags for ${overriddenRejectedFiles.length} selected clip${overriddenRejectedFiles.length === 1 ? "" : "s"}`] : [])],
       workflow: planned.workflow,
       status: "ready"
     };
@@ -2315,7 +2354,10 @@ async function processRenderJob(id) {
   const music = job.assetId ? project.assets.find((asset) => asset.id === job.assetId)?.path : null;
   const selectedIds = new Set((draft.fileIds || []).map(String));
   const selectedDraftFiles = selectedIds.size ? project.files.filter((file) => selectedIds.has(file.id)) : project.files;
-  const draftFiles = selectedDraftFiles.filter((file) => file.metadata?.aiDecision !== "rejected" && !hasHardRenderRejectEvidence(file));
+  const userOverrideIds = new Set([...(draft.userOverrideFileIds || []), ...(draft.workflow?.userOverrideFileIds || [])].map(String));
+  const draftFiles = selectedDraftFiles
+    .filter((file) => isGenerationEligibleFile(file, userOverrideIds))
+    .map((file) => withUserAiOverride(file, userOverrideIds));
   if (!draftFiles.length) {
     throw new Error("No usable highlight source clips were available for rendering.");
   }
@@ -2693,6 +2735,21 @@ async function processRenderJob(id) {
   latestDraft.musicDuration = draft.musicDuration;
   latestDraft.musicRepeats = draft.musicRepeats;
   latestDraft.encoding = draft.encoding;
+  const usedFileIds = new Set([
+    ...(latestDraft.fileIds || []),
+    ...(latestDraft.segments || []).map((segment) => segment.fileId)
+  ].filter(Boolean));
+  if (usedFileIds.size) {
+    const usedAt = new Date().toISOString();
+    latestProject.files.forEach((file) => {
+      if (!usedFileIds.has(file.id)) return;
+      file.metadata = {
+        ...file.metadata,
+        generationUseCount: Math.max(0, Number(file.metadata?.generationUseCount || 0)) + 1,
+        generationLastUsedAt: usedAt
+      };
+    });
+  }
   await saveProject(latestProject);
   if (controller.signal.aborted) {
     await rm(outputPath, { force: true }).catch(() => undefined);
@@ -3000,7 +3057,7 @@ function hasBackendDetails(value = "") {
 
 function unsafePublicMessage(value = "") {
   const text = String(value || "");
-  return !text.trim() || text.length > 240 || /[\r\n]/.test(text) || hasBackendDetails(text);
+  return !text.trim() || text.length > 240 || /[\n]/.test(text) || hasBackendDetails(text);
 }
 
 function publicStatusMessage(value, fallback) {

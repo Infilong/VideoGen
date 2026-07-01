@@ -73,7 +73,7 @@ During Vite development the client calls `http://127.0.0.1:4312/api`. In product
 The backend lives in `server/`.
 
 - `server/index.mjs` starts the Express API, owns storage paths, serves media, manages ingest, fast indexing, Vision AI review, highlight confirmation/rejection, draft generation, render jobs, final review pauses, recovery, and cleanup.
-- `server/media.mjs` wraps FFmpeg/FFprobe and contains candidate scoring, planning, segment alignment, visual-review edits, music extension, and rendering helpers.
+- `server/media.mjs` wraps FFmpeg/FFprobe and contains candidate scoring, planning, segment alignment, visual-review edits, music extension, and rendering helpers. Shared JSON persistence lives in `server/json-store.mjs`, and the render duration cap lives in `server/policy.mjs`.
 - `server/dev.mjs` runs the API and Vite dev server together.
 - `server/media.test.ts` covers planning, review, and render-helper behavior.
 

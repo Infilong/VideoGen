@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { alignTrailerSegmentsToMusic, applyVisualReviewEditsToDraft, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, fitTimelineToDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, polishFinalTimeline, probe, refineDraftPlan, renderHighlight, run, saveJson, scoreCandidateWindow } from "./media.mjs";
+import { alignTrailerSegmentsToMusic, applyVisualReviewEditsToDraft, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, fitTimelineToDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, polishFinalTimeline, probe, recommendTrailerDuration, refineDraftPlan, renderHighlight, run, saveJson, scoreCandidateWindow } from "./media.mjs";
 
 const files = [
   {
@@ -19,7 +19,7 @@ describe("server highlight planning", () => {
     expect(canStartBackgroundJob({ status: "processing", cancelRequested: true }, ["processing"])).toBe(false);
   });
 
-  it("enforces the hard five-minute maximum", () => {
+  it("enforces the hard three-minute maximum", () => {
     const result = createSegments(files, 600, 90);
     expect(result.duration).toBeLessThanOrEqual(MAX_DURATION);
   });
@@ -60,6 +60,28 @@ describe("server highlight planning", () => {
 
     expect(createSegments(ranked, 30, 90).segments.map((segment) => segment.fileId)).not.toContain("boring-local-winner");
     expect(buildAgenticEditPlan(ranked, 30, { allowReviewCandidates: true, allowIndexedAfterUncertainVision: true }).segments.map((segment) => segment.fileId)).not.toContain("boring-local-winner");
+  });
+
+  it("allows a user-overridden AI rejection to be used for generation", () => {
+    const ranked = [
+      {
+        id: "battlefield-false-red-flag",
+        name: "Battlefield 6 2026.01.02 - 22.49.15.33.DVR.mp4",
+        metadata: {
+          duration: 120,
+          actionScore: 94,
+          indexScore: 91,
+          highlightStart: 48,
+          aiDecision: "rejected",
+          aiDecisionOverride: "include",
+          indexDescription: "AI red flag overridden by user",
+          candidateWindows: [{ start: 44, end: 62, duration: 18, score: 91, reason: "user_override" }]
+        }
+      }
+    ];
+
+    expect(createSegments(ranked, 30, 90).segments.map((segment) => segment.fileId)).toContain("battlefield-false-red-flag");
+    expect(buildAgenticEditPlan(ranked, 30, { allowReviewCandidates: true, allowIndexedAfterUncertainVision: true }).segments.map((segment) => segment.fileId)).toContain("battlefield-false-red-flag");
   });
 
   it("keeps old AI-rejected text usable when the decision is only low confidence", () => {
@@ -225,6 +247,21 @@ describe("server highlight planning", () => {
 
     expect(result.segments).toHaveLength(0);
     expect(result.workflow.rejectedMoments).toBeGreaterThan(0);
+  });
+
+  it("recommends a near-three-minute trailer when many long recordings have short verified payoffs", () => {
+    const sources = Array.from({ length: 8 }, (_, index) => ({
+      id: `verified-long-${index}`,
+      name: `verified-long-${index}.mp4`,
+      metadata: {
+        duration: 150,
+        semanticQuality: "verified",
+        semanticScore: 90 - index,
+        semanticEvents: [{ start: 45, end: 52, score: 92 - index, state: "impact", action: "vehicle destruction", storyRole: "payoff", payoffVerified: true }]
+      }
+    }));
+
+    expect(recommendTrailerDuration(sources, 0)).toBe(180);
   });
 
   it("builds an audited edit without duplicate intervals or rejected UI states", () => {
@@ -653,7 +690,7 @@ describe("server highlight planning", () => {
     }
   });
 
-  it("can align a trailer to two soundtrack plays up to the five-minute cap", async () => {
+  it("can align a trailer to two soundtrack plays up to the three-minute cap", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "highlightai-repeat-music-"));
     const musicPath = path.join(dir, "repeat-tone.wav");
     try {

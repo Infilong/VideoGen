@@ -95,13 +95,6 @@ type HighlightSidebarPart = {
   item?: HighlightReviewItem;
   moment?: ConfirmedHighlightMoment;
 };
-type MusicCoveragePrompt = {
-  idea: VideoIdea;
-  clipDuration: number;
-  musicDuration: number;
-  musicName: string;
-  clipCount: number;
-};
 type ReviewMusicCoveragePrompt = {
   clipDuration: number;
   musicDuration: number;
@@ -537,19 +530,46 @@ function visionReviewCandidates(files: MediaAsset[]) {
     });
 }
 
+function intervalDurationSeconds(item: { start?: number; end?: number; duration?: number }) {
+  const start = Number(item.start) || 0;
+  const end = Number(item.end);
+  return Math.max(0, Number(item.duration) || (Number.isFinite(end) ? end - start : 0));
+}
+
+function luckyPlanningDuration(file: MediaAsset) {
+  const metadata = file.metadata;
+  if (!metadata) return 0;
+  const fileDuration = Number(metadata.duration || 0);
+  const confirmedSeconds = (metadata.confirmedHighlightMoments || [])
+    .reduce((sum, moment) => sum + Math.min(18, Math.max(4, intervalDurationSeconds(moment))), 0);
+  const verifiedSeconds = (metadata.semanticEvents || [])
+    .filter((event) => event.payoffVerified === true)
+    .reduce((sum, event) => sum + Math.min(18, Math.max(6, intervalDurationSeconds(event) + 6)), 0);
+  const candidateSeconds = (metadata.candidateWindows || [])
+    .filter((window) => Number(window.score || 0) >= 72)
+    .slice(0, 3)
+    .reduce((sum, window) => sum + Math.min(16, Math.max(6, intervalDurationSeconds(window) || 8)), 0);
+  const planned = confirmedSeconds + verifiedSeconds || candidateSeconds || Math.min(fileDuration, 18);
+  return Math.min(fileDuration || planned, Math.max(4, planned));
+}
+
 export function chooseDiversifiedClips(
   files: MediaAsset[],
   recentSelections: string[][] = [],
   random: () => number = Math.random,
-  limit = 12
+  limit = 20,
+  targetDuration = 180
 ) {
-  const eligible = files.filter((file) =>
+  const ready = files.filter((file) =>
     !looksLikeGeneratedExport(file.name) &&
     file.metadata?.duration &&
     file.metadata.videoCodec !== "pending" &&
     semanticState(file) !== "rejected"
   );
-  const target = Math.min(limit, eligible.length);
+  const verified = ready.filter((file) => semanticState(file) === "verified" || (file.metadata?.confirmedHighlightMoments || []).length > 0);
+  const useVerifiedWindows = verified.length > 0;
+  const eligible = useVerifiedWindows ? verified : ready;
+  const plannedDuration = (file: MediaAsset) => useVerifiedWindows ? luckyPlanningDuration(file) : Number(file.metadata?.duration || 0);
   const selected: MediaAsset[] = [];
   const represented = new Map<string, number>();
   const recentUse = new Map<string, number>();
@@ -558,37 +578,52 @@ export function chooseDiversifiedClips(
     const weight = age === history.length - 1 ? 3 : age + 1;
     selection.forEach((id) => recentUse.set(id, (recentUse.get(id) || 0) + weight));
   });
+  const selectionDuration = () => selected.reduce((sum, file) => sum + plannedDuration(file), 0);
 
-  while (selected.length < target) {
+  while (selected.length < Math.min(limit, eligible.length)) {
+    const currentDuration = selectionDuration();
     const remaining = eligible.filter((file) => !selected.some((item) => item.id === file.id));
     if (!remaining.length) break;
     const candidate = remaining
       .map((file) => {
         const tags = usefulTags(file);
+        const duration = plannedDuration(file);
+        const projected = currentDuration + duration;
         const diversity = tags.reduce((sum, tag) => {
           const uses = represented.get(tag) || 0;
           return sum + (uses === 0 ? 18 : uses === 1 ? 4 : -12);
         }, tags.length ? 0 : -10);
         const quality = Number(file.metadata?.semanticScore ?? file.metadata?.indexScore ?? file.metadata?.actionScore ?? 0);
+        const underfillBonus = projected <= targetDuration ? Math.min(34, duration / 2) : 0;
+        const overTargetPenalty = projected > targetDuration ? (projected - targetDuration) * 0.7 : 0;
+        const shortfallPenalty = projected < targetDuration * 0.7 ? (targetDuration * 0.7 - projected) * 0.18 : 0;
         return {
           file,
           tags,
-          value: quality * 0.72 + diversity - (recentUse.get(file.id) || 0) * 9 + random() * 12
+          value: quality * 0.72 + diversity + underfillBonus - overTargetPenalty - shortfallPenalty - (recentUse.get(file.id) || 0) * 9 + random() * 12
         };
       })
       .sort((a, b) => b.value - a.value || a.file.id.localeCompare(b.file.id))[0];
+    if (!candidate) break;
     selected.push(candidate.file);
     candidate.tags.forEach((tag) => represented.set(tag, (represented.get(tag) || 0) + 1));
   }
 
+  if (!selected.length && eligible.length) selected.push(eligible[0]);
+
   const previous = new Set(recentSelections.at(-1) || []);
-  if (eligible.length > target && selected.length && selected.every((file) => previous.has(file.id))) {
+  if (eligible.length > selected.length && selected.length && selected.every((file) => previous.has(file.id))) {
+    const currentDuration = selectionDuration();
+    const removedDuration = selected.length ? plannedDuration(selected[selected.length - 1]) : 0;
     const replacement = eligible
       .filter((file) => !previous.has(file.id) && !selected.some((item) => item.id === file.id))
-      .sort((a, b) =>
-        Number(b.metadata?.semanticScore ?? b.metadata?.indexScore ?? b.metadata?.actionScore ?? 0) -
-        Number(a.metadata?.semanticScore ?? a.metadata?.indexScore ?? a.metadata?.actionScore ?? 0)
-      )[0];
+      .sort((a, b) => {
+        const aProjected = currentDuration - removedDuration + plannedDuration(a);
+        const bProjected = currentDuration - removedDuration + plannedDuration(b);
+        return Math.abs(aProjected - targetDuration) - Math.abs(bProjected - targetDuration) ||
+          Number(b.metadata?.semanticScore ?? b.metadata?.indexScore ?? b.metadata?.actionScore ?? 0) -
+          Number(a.metadata?.semanticScore ?? a.metadata?.indexScore ?? a.metadata?.actionScore ?? 0);
+      })[0];
     if (replacement) selected[selected.length - 1] = replacement;
   }
   return selected.map((file) => file.id);
@@ -601,8 +636,7 @@ function looksLikeGeneratedExport(name: string) {
 function isSelectableSourceClip(file: MediaAsset) {
   return !looksLikeGeneratedExport(file.name) &&
     Boolean(file.metadata?.duration) &&
-    file.metadata?.videoCodec !== "pending" &&
-    semanticState(file) !== "rejected";
+    file.metadata?.videoCodec !== "pending";
 }
 
 function normalizeAssets(assets: MediaAsset[]) {
@@ -620,7 +654,7 @@ function assetDuration(asset: MediaAsset | null) {
 function effectiveMusicDuration(asset: MediaAsset | null, repeats: number) {
   const duration = assetDuration(asset);
   if (!duration) return 0;
-  return Math.min(300, duration * Math.max(1, repeats || 1));
+  return Math.min(180, duration * Math.max(1, repeats || 1));
 }
 
 function totalSourceClipDuration(files: MediaAsset[]) {
@@ -648,9 +682,9 @@ function App() {
   const [clipSort, setClipSort] = useState<"score" | "duration" | "name">("score");
   const [activeTag, setActiveTag] = useState("");
   const [visibleClipLimit, setVisibleClipLimit] = useState(40);
-  const [libraryView, setLibraryView] = useState<"grid" | "list" | "detail">(() => {
+  const [libraryView, setLibraryView] = useState<"grid" | "grid-4" | "list" | "detail">(() => {
     const saved = localStorage.getItem("highlight-ai-library-view");
-    return saved === "list" || saved === "detail" ? saved : "grid";
+    return saved === "grid-4" || saved === "list" || saved === "detail" ? saved : "grid";
   });
   const [theme, setTheme] = useState<"dark" | "light">(() => localStorage.getItem("highlight-ai-theme") === "light" ? "light" : "dark");
   const [appRoute, setAppRoute] = useState<"dashboard" | "review">(() => window.location.pathname === "/review" ? "review" : "dashboard");
@@ -659,7 +693,6 @@ function App() {
   const [assetBrowser, setAssetBrowser] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [generatedLibraryOpen, setGeneratedLibraryOpen] = useState(false);
-  const [musicCoveragePrompt, setMusicCoveragePrompt] = useState<MusicCoveragePrompt | null>(null);
   const [reviewMusicCoveragePrompt, setReviewMusicCoveragePrompt] = useState<ReviewMusicCoveragePrompt | null>(null);
   const [assetQuery, setAssetQuery] = useState("cinematic gaming");
   const [publicAudio, setPublicAudio] = useState<PublicAudio[]>([]);
@@ -744,7 +777,6 @@ function App() {
   }, [libraryView]);
 
   useEffect(() => {
-    setMusicCoveragePrompt(null);
     setReviewMusicCoveragePrompt(null);
   }, [selectedAudioAssetId, musicRepeats, selectedVideoIds.join("|")]);
 
@@ -1341,6 +1373,14 @@ function App() {
     setNotice(message);
   }
 
+  function confirmedMomentOverlaps(file: MediaAsset, item: { start: number; end: number }) {
+    return (file.metadata?.confirmedHighlightMoments || []).some((moment) => {
+      const start = Number(moment.start) || 0;
+      const end = Number(moment.end) || start + (Number(moment.duration) || 0);
+      return intervalsOverlapMeaningfully({ start, end }, item);
+    });
+  }
+
   function draftSegmentsToReviewItems(draft: Draft, files: MediaAsset[], source = "draft-plan") {
     const fileById = new Map(files.map((file) => [file.id, file]));
     return (draft.segments || [])
@@ -1351,7 +1391,8 @@ function App() {
         const start = Math.max(0, Math.min(Math.max(0, duration - 1), Number(segment.start) || 0));
         const rawEnd = start + Math.max(1, Number(segment.duration) || 1);
         const end = Math.max(start + 1, Math.min(duration || rawEnd, rawEnd));
-        const alreadyReviewed = file.metadata?.reviewed === true;
+        const alreadyConfirmed = confirmedMomentOverlaps(file, { start, end });
+        const alreadyReviewed = file.metadata?.reviewed === true || alreadyConfirmed;
         return {
           id: `${file.id}:${source}:${draft.id}:${index}:${Math.round(start * 10)}:${Math.round(end * 10)}`,
           file,
@@ -1365,30 +1406,96 @@ function App() {
           source: segment.source || source,
           label: source === "final-review" ? "Final review" : "Planned cut",
           confidence: segment.confidence || confidenceFromScore(Number(segment.score) || Number(file.metadata.semanticScore) || Number(file.metadata.indexScore) || 65, "medium"),
-          confirmed: alreadyReviewed,
+          confirmed: alreadyConfirmed,
           reviewed: alreadyReviewed
         } as HighlightReviewItem;
       })
       .filter(Boolean) as HighlightReviewItem[];
   }
 
-  function beginDraftSegmentReview(draft: Draft, sourceProject: Project, message = "Review the planned parts, trim weak edges, then generate the video.") {
-    const items = draftSegmentsToReviewItems(draft, sourceProject.files);
+  function selectedDraftReviewItems(draft: Draft, sourceProject: Project, plannedItems: HighlightReviewItem[], limit = 20) {
+    const fileIds = [...new Set((draft.fileIds || []).map(String))];
+    if (!fileIds.length || fileIds.length < limit) return plannedItems.filter((item) => !item.reviewed).slice(0, limit);
+    const fileById = new Map(sourceProject.files.map((file) => [file.id, file]));
+    const plannedReviewItems = plannedItems.filter((item) => !item.reviewed);
+    const represented = new Set(plannedReviewItems.map((item) => item.file.id));
+    const selectedFiles = fileIds
+      .map((id) => fileById.get(id))
+      .filter(Boolean) as MediaAsset[];
+    const supplemental = candidateItemsForReview(selectedFiles)
+      .filter((item) => !item.reviewed && !represented.has(item.file.id));
+    const additions: HighlightReviewItem[] = [];
+    for (const item of supplemental) {
+      if (represented.has(item.file.id)) continue;
+      represented.add(item.file.id);
+      additions.push({
+        ...item,
+        id: `${item.id}:selected-review`,
+        label: item.label === "AI verified" ? "Selected verified" : item.label
+      });
+      if (plannedReviewItems.length + additions.length >= limit) break;
+    }
+    return [...plannedReviewItems, ...additions].slice(0, Math.min(limit, selectedFiles.filter((file) => file.metadata?.reviewed !== true && !(file.metadata?.confirmedHighlightMoments || []).length).length || limit));
+  }
+
+  async function beginDraftSegmentReview(draft: Draft, sourceProject: Project, message = "Review the planned parts, trim weak edges, then generate the video.") {
+    const reviewDraft = draft.fileIds?.length || !selectedVideoIds.length ? draft : { ...draft, fileIds: selectedVideoIds };
+    const plannedItems = draftSegmentsToReviewItems(reviewDraft, sourceProject.files);
+    const items = selectedDraftReviewItems(reviewDraft, sourceProject, plannedItems);
+    const savedConfirmedCount = confirmedMomentSegmentsForDraft(reviewDraft, sourceProject.files).length;
     setPendingReviewDraftId(draft.id);
     setPendingHighlightGenerateIdea(null);
     setReviewGeneratePrompt(false);
     setReviewGeneratePromptDismissed(false);
-    if (!items.length) {
-      setHighlightReview(null);
-      setHighlightTrim(null);
-      navigateToDashboard();
-      setNotice("The draft did not contain usable planned cuts. Choose stronger clips or run Vision AI again.");
-      return;
-    }
-    setHighlightReview(makeHighlightReviewSession(items, { total: items.length }));
-    setHighlightTrim({ start: items[0].start, end: items[0].end });
+    setReviewMusicCoveragePrompt(null);
+    setHighlightReview(makeHighlightReviewSession(items, { total: items.length, index: 0, confirmed: savedConfirmedCount }));
+    setHighlightTrim(items[0] ? { start: items[0].start, end: items[0].end } : null);
     navigateToReviewPage();
-    setNotice(message);
+    if (items.length) {
+      setNotice(message);
+    } else if (savedConfirmedCount) {
+      setNotice("All selected highlight parts are already confirmed. Checking music length before rendering.");
+    } else {
+      setNotice("No reviewable planned parts were found. Choose stronger clips or run Vision AI again.");
+    }
+  }
+
+  function segmentSignature(segment: Segment) {
+    return `${segment.fileId}:${Math.round((Number(segment.start) || 0) * 10)}:${Math.round((Number(segment.duration) || 0) * 10)}`;
+  }
+
+  function uniqueSegments(segments: Segment[]) {
+    const seen = new Set<string>();
+    const next: Segment[] = [];
+    for (const segment of segments) {
+      const key = segmentSignature(segment);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      next.push(segment);
+    }
+    return next;
+  }
+
+  function confirmedMomentSegmentsForDraft(draft: Draft, files: MediaAsset[]): Segment[] {
+    const allowedIds = new Set((draft.fileIds || []).map(String));
+    return files
+      .filter((file) => !allowedIds.size || allowedIds.has(file.id))
+      .flatMap((file) => (file.metadata?.confirmedHighlightMoments || []).map((moment) => {
+        const start = Math.max(0, Number(moment.start) || 0);
+        const end = Math.max(start, Number(moment.end) || start + Number(moment.duration || 0));
+        const duration = Math.max(0, end - start);
+        if (duration < 1) return null;
+        return {
+          fileId: file.id,
+          start: Math.round(start * 10) / 10,
+          duration: Math.round(duration * 10) / 10,
+          minDuration: Math.min(Math.round(duration * 10) / 10, Math.max(1, Number(moment.duration || duration))),
+          score: Math.round(Number(moment.score) || Number(file.metadata?.semanticScore) || Number(file.metadata?.indexScore) || 80),
+          storyRole: moment.storyRole || "approved highlight",
+          source: moment.source || "saved-confirmed",
+          confidence: "high" as const
+        } as Segment;
+      }).filter(Boolean) as Segment[]);
   }
 
   function confirmedReviewItemsToSegments(session: HighlightReviewSession): Segment[] {
@@ -1404,6 +1511,13 @@ function App() {
         source: item.source === "draft-plan" ? "human-reviewed" : item.source || "human-reviewed",
         confidence: "high"
       }));
+  }
+
+  function approvedSegmentsForReviewDraft(draft: Draft, session: HighlightReviewSession, files: MediaAsset[]) {
+    return uniqueSegments([
+      ...confirmedMomentSegmentsForDraft(draft, files),
+      ...confirmedReviewItemsToSegments(session)
+    ]);
   }
 
   function confirmedMomentToReviewItem(file: MediaAsset, moment: ConfirmedHighlightMoment): HighlightReviewItem {
@@ -1493,7 +1607,7 @@ function App() {
     }
   }
 
-  async function createDraft(idea: VideoIdea, options: { ignoreMusicCoverage?: boolean } = {}) {
+  async function createDraft(idea: VideoIdea) {
     if (!project) return;
     const generationSourceVideos = selectedVideoIds.length ? selectedVideos : project.files.filter(isSelectableSourceClip);
     const generationVideoIds = generationSourceVideos
@@ -1511,22 +1625,7 @@ function App() {
       setNotice(`${notReady.length} selected video${notReady.length === 1 ? " is" : "s are"} still being analyzed. Wait until the folder progress finishes, then create the trailer.`);
       return;
     }
-    const readyGenerationVideos = generationSourceVideos.filter((file) => generationVideoIds.includes(file.id));
-    const clipDuration = totalSourceClipDuration(readyGenerationVideos);
-    const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
-    if (!options.ignoreMusicCoverage && selectedAudioAsset && musicDuration > 0 && clipDuration + 0.5 < musicDuration) {
-      setMusicCoveragePrompt({
-        idea,
-        clipDuration,
-        musicDuration,
-        musicName: selectedAudioAsset.name,
-        clipCount: readyGenerationVideos.length
-      });
-      setOperationIssue(null);
-      setNotice("The selected clips are shorter than the soundtrack. Add more clips before generating for a stronger edit.");
-      return;
-    }
-    setMusicCoveragePrompt(null);
+    setReviewMusicCoveragePrompt(null);
     setPendingHighlightGenerateIdea(null);
     setGenerating(true);
     setRenderJob(null);
@@ -1606,14 +1705,15 @@ function App() {
           duration: item.duration
         }))
       );
-      const nextDrafts = [...drafts, primary];
+      const primaryWithFileIds = primary.fileIds?.length ? primary : { ...primary, fileIds: generationVideoIds };
+      const nextDrafts = [...drafts, primaryWithFileIds];
       setDrafts(nextDrafts);
-      setProject((current) => current ? { ...current, drafts: [...current.drafts, primary] } : current);
+      setProject((current) => current ? { ...current, drafts: [...current.drafts, primaryWithFileIds] } : current);
       setActiveDraft(nextDrafts.length - 1);
       setStage("drafts");
-      beginDraftSegmentReview(primary, {
+      await beginDraftSegmentReview(primaryWithFileIds, {
         ...workingProject,
-        drafts: [...(workingProject.drafts || []), primary]
+        drafts: [...(workingProject.drafts || []), primaryWithFileIds]
       }, "AI planned the edit. Review each part, trim weak edges, reject bad cuts, then generate.");
     } catch (error) {
       const issue = issueFromError(error);
@@ -1681,8 +1781,33 @@ function App() {
         beginFinalReviewDecision(result.job, result.draft);
         return;
       }
-      setDrafts((current) => current.map((item) => item.id === result.draft.id ? result.draft : item));
-      setProject((current) => current ? { ...current, drafts: current.drafts.map((item) => item.id === result.draft.id ? result.draft : item) } : current);
+      const usedFileIds = new Set([
+        ...(result.draft.fileIds || []),
+        ...(result.draft.segments || []).map((segment) => segment.fileId)
+      ].filter(Boolean));
+      const usedAt = new Date().toISOString();
+      const markFileUsed = (file: MediaAsset): MediaAsset => {
+        if (!usedFileIds.has(file.id) || !file.metadata) return file;
+        return {
+          ...file,
+          metadata: {
+            ...file.metadata,
+            generationUseCount: Math.max(0, Number(file.metadata?.generationUseCount || 0)) + 1,
+            generationLastUsedAt: usedAt
+          }
+        };
+      };
+      setDrafts((current) => current.some((item) => item.id === result.draft.id)
+        ? current.map((item) => item.id === result.draft.id ? result.draft : item)
+        : [...current, result.draft]);
+      if (usedFileIds.size) setRecordings((current) => current.map(markFileUsed));
+      setProject((current) => current ? {
+        ...current,
+        files: usedFileIds.size ? current.files.map(markFileUsed) : current.files,
+        drafts: current.drafts.some((item) => item.id === result.draft.id)
+          ? current.drafts.map((item) => item.id === result.draft.id ? result.draft : item)
+          : [...current.drafts, result.draft]
+      } : current);
       setNotice("Export complete. Your MP4 is ready.");
       setPreviewVideo({ title: result.draft.title, url: localMediaUrl(result.url), generated: true, localPath: result.localPath || result.draft.exportPath });
     } catch (error) {
@@ -2072,11 +2197,7 @@ function App() {
       setNotice("Generated exports are shown for visibility, but they are not selectable as source footage.");
       return;
     }
-    if (file && semanticState(file) === "rejected") {
-      setNotice("This clip was rejected as low-signal footage and will not be used for generation.");
-      return;
-    }
-    setGenerationAdvice("");
+   setGenerationAdvice("");
     setSelectedVideoIds((current) => {
       if (current.includes(id)) return current.filter((item) => item !== id);
       return [...current, id];
@@ -2141,13 +2262,21 @@ function App() {
 
   function addMoreHighlightCandidates() {
     const existing = highlightReview?.items || [];
+    const activeDraftScopeIds = new Set(
+      reviewingPlannedDraft
+        ? (drafts.find((draft) => draft.id === pendingReviewDraftId)?.fileIds || existing.map((item) => item.file.id))
+        : []
+    );
+    const scopedLibrary = reviewingPlannedDraft && activeDraftScopeIds.size
+      ? rankedLibrary.filter((file) => activeDraftScopeIds.has(file.id))
+      : rankedLibrary;
     const savedVerifiedItems = reviewingPlannedDraft
-      ? rankedLibrary
+      ? scopedLibrary
         .flatMap((file) => (file.metadata?.confirmedHighlightMoments || []).map((moment) => confirmedMomentToReviewItem(file, moment)))
         .filter((item) => !isDuplicateReviewItem(item, existing))
       : [];
     const candidatePool = reviewingPlannedDraft
-      ? optionalReviewItems(rankedLibrary, 40)
+      ? optionalReviewItems(scopedLibrary, 40)
       : reviewHighlightMoments;
     const pendingItems = candidatePool.filter((item) =>
       !isDuplicateReviewItem(item, existing) &&
@@ -2412,7 +2541,7 @@ function App() {
     }));
   }
 
-  async function generateFromHighlightReview(options: { ignoreMusicCoverage?: boolean } = {}) {
+  async function generateFromHighlightReview() {
     if (pendingReviewDraftId) {
       if (!project || !highlightReview) return;
       const draft = drafts.find((item) => item.id === pendingReviewDraftId) || project.drafts.find((item) => item.id === pendingReviewDraftId);
@@ -2420,14 +2549,14 @@ function App() {
         setNotice("The planned draft could not be found. Create the draft again.");
         return;
       }
-      const segments = confirmedReviewItemsToSegments(highlightReview);
+      const segments = approvedSegmentsForReviewDraft(draft, highlightReview, project.files);
       if (!segments.length) {
         setNotice("Agree to at least one planned part before generating. Rejected and skipped parts will not be used.");
         return;
       }
       const duration = totalSegmentDuration(segments);
       const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
-      if (!options.ignoreMusicCoverage && selectedAudioAsset && musicDuration > 0 && duration + 0.5 < musicDuration) {
+      if (selectedAudioAsset && musicDuration > 0 && duration + 0.5 < musicDuration) {
         setReviewGeneratePrompt(false);
         setReviewGeneratePromptDismissed(false);
         setReviewMusicCoveragePrompt({
@@ -2729,6 +2858,7 @@ function App() {
     const bestTime = reliableFocusTime(file);
     const moments = potentialMomentSummary(file);
     const state = semanticState(file);
+    if (state === "rejected") return "This clip was flagged by AI; you can still select it if this is a false red flag.";
     if (state === "needs_check") return "Needs Vision AI check before it is ranked as verified.";
     if (state === "reviewed") {
       return [
@@ -2744,7 +2874,7 @@ function App() {
         tags.length ? `Tags: ${tags.join(", ")}.` : ""
       ].filter(Boolean).join(" ");
     }
-    if (tags.length) return `${tags.join(" · ")}${Number.isFinite(bestTime) ? `. Strongest moment near ${formatTime(bestTime || 0)}.` : moments ? ` ${moments}` : "."}`;
+    if (tags.length) return `${tags.join(" - ")}${Number.isFinite(bestTime) ? `. Strongest moment near ${formatTime(bestTime || 0)}.` : moments ? ` ${moments}` : "."}`;
     if (!file.metadata?.duration || file.metadata.videoCodec === "pending") return "Background analysis is preparing this clip.";
     return `Local signals found a candidate moment near ${formatTime(bestTime || 0)}. Vision AI will identify the game-specific subjects, actions, objectives, and result.`;
   };
@@ -2785,6 +2915,7 @@ function App() {
   const availableIdeas = analysis?.ideas?.length ? analysis.ideas : curatedIdeas;
   const recommendedIdea = availableIdeas.find((idea) => idea.id === "trailer") || availableIdeas[0];
   const generationSourceVideos = selectedVideoIds.length ? selectedVideos : rankedLibrary.filter(isSelectableSourceClip);
+  const selectedRejectedVideos = selectedVideos.filter((file) => semanticState(file) === "rejected");
   const generationSourceLabel = selectedVideoIds.length
     ? `${selectedVideoIds.length} selected clip${selectedVideoIds.length === 1 ? "" : "s"}`
     : `${generationSourceVideos.length} confirmed clip${generationSourceVideos.length === 1 ? "" : "s"}`;
@@ -2852,6 +2983,7 @@ function App() {
     }
   }
   const pendingReviewSidebarCount = reviewSidebarParts.filter((part) => part.status === "pending").length;
+  const savedReviewSidebarCount = reviewSidebarParts.filter((part) => part.status === "confirmed").length;
   const selectedWeakOrStale = selectedVideos.filter((file) => ["needs_check", "reviewed", "uncertain"].includes(semanticState(file))).length;
   const selectedIndexedCandidates = selectedVideos.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
   const selectionReady = selectedVideoIds.length
@@ -2895,9 +3027,9 @@ function App() {
                   ? "Background AI analysis needs attention"
                   : "Background analysis is ready";
   const backgroundMessage = folderImportActive
-    ? `${Math.min(ingestProgress?.processedFiles || 0, ingestProgress?.totalFiles || project?.files.length || 0)} of ${ingestProgress?.totalFiles || project?.files.length || 0} files analyzed${ingestProgress?.status === "paused" ? " · progress saved" : ""}`
+    ? `${Math.min(ingestProgress?.processedFiles || 0, ingestProgress?.totalFiles || project?.files.length || 0)} of ${ingestProgress?.totalFiles || project?.files.length || 0} files analyzed${ingestProgress?.status === "paused" ? " - progress saved" : ""}`
     : ["processing", "paused"].includes(fastIndexStatus)
-      ? `${fastIndexCounts.processed} of ${fastIndexCounts.total || project?.files.length || 0} indexed${fastIndexStatus === "paused" ? " · progress saved" : ""}`
+      ? `${fastIndexCounts.processed} of ${fastIndexCounts.total || project?.files.length || 0} indexed${fastIndexStatus === "paused" ? " - progress saved" : ""}`
       : preprocessJob && ["processing", "paused"].includes(preprocessJob.status)
         ? `${folderVideosChecked} of ${folderVideosTotal} videos checked${preprocessJob.status === "paused" ? " - progress saved" : ""}`
         : visionReviewIncomplete
@@ -2933,7 +3065,8 @@ function App() {
     const reviewComplete = highlightReview.total > 0 && highlightReview.reviewed >= highlightReview.total;
     const queueExhausted = highlightReview.items.length === 0;
     if ((reviewComplete || queueExhausted) && highlightReview.confirmed > 0) {
-      const segments = confirmedReviewItemsToSegments(highlightReview);
+      const draft = drafts.find((item) => item.id === pendingReviewDraftId) || project?.drafts.find((item) => item.id === pendingReviewDraftId);
+      const segments = draft && project ? approvedSegmentsForReviewDraft(draft, highlightReview, project.files) : confirmedReviewItemsToSegments(highlightReview);
       const duration = totalSegmentDuration(segments);
       const musicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
       if (selectedAudioAsset && musicDuration > 0 && duration + 0.5 < musicDuration) {
@@ -2979,12 +3112,11 @@ function App() {
         <div>
           <button onClick={() => {
             setReviewMusicCoveragePrompt(null);
-            addMoreHighlightCandidates();
-          }}><Plus size={15} /> Add more parts</button>
-          <button onClick={() => {
-            setReviewMusicCoveragePrompt(null);
-            void generateFromHighlightReview({ ignoreMusicCoverage: true });
-          }}>Generate anyway</button>
+            setReviewGeneratePrompt(false);
+            setReviewGeneratePromptDismissed(false);
+            navigateToDashboard();
+            setNotice("Select more clips, then click Generate video again. Your reviewed highlights are still saved.");
+          }}><Plus size={15} /> Choose more clips</button>
         </div>
       </section>
     );
@@ -3000,7 +3132,7 @@ function App() {
             <span className="panel-label">{reviewingPlannedDraft ? "Generation review" : "Review page"}</span>
             <h2>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : reviewingPlannedDraft ? "Review planned video parts" : "Highlight review"}</h2>
             <p>{highlightReview
-              ? `${reviewedCount} of ${highlightReview.total} reviewed · ${highlightReview.confirmed} agreed${activeHighlightReviewItem ? ` · Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
+              ? `${reviewedCount} of ${highlightReview.total} reviewed - ${highlightReview.confirmed} agreed${activeHighlightReviewItem ? ` - Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
               : "Choose clips first, then start highlight review."}</p>
           </div>
         </header>
@@ -3082,7 +3214,7 @@ function App() {
           <aside className="picked-highlight-panel">
             <div>
               <span className="panel-label">{reviewingPlannedDraft ? "Planned parts" : "Review queue"}</span>
-              <strong>{pendingReviewSidebarCount} to review · {reviewConfirmedHighlightParts.length} saved</strong>
+              <strong>{pendingReviewSidebarCount} to review - {savedReviewSidebarCount} saved</strong>
             </div>
             <div className="picked-highlight-list">
               {reviewSidebarParts.length ? reviewSidebarParts.map((part) => (
@@ -3094,7 +3226,7 @@ function App() {
                   </button>
                   <button className="picked-highlight-view" onClick={() => part.item ? viewHighlightReviewCandidate(part.item) : part.moment && viewConfirmedHighlightPart(part.file, part.moment)}>
                     <strong>{part.file.name.replace(/\.[^.]+$/, "")}</strong>
-                    <small>{formatTime(part.start)}-{formatTime(part.end)} · {part.status === "confirmed" ? "saved highlight" : "AI uncertain"} · {part.action || part.source || "manual review"}</small>
+                    <small>{formatTime(part.start)}-{formatTime(part.end)} - {part.status === "confirmed" ? "saved highlight" : "AI uncertain"} - {part.action || part.source || "manual review"}</small>
                   </button>
                   <div className="picked-highlight-row-actions">
                     {part.status === "confirmed" && part.moment ? (
@@ -3115,7 +3247,7 @@ function App() {
             <div className="picked-highlight-actions">
               {renderReviewMusicCoveragePrompt()}
               <button onClick={addMoreHighlightCandidates}><Plus size={16} /> Add more</button>
-              <button className="confirm-highlight-button" disabled={!reviewGenerationReady || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate video</button>
+              <button className="confirm-highlight-button" disabled={!reviewGenerationReady || Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate video</button>
             </div>
           </aside>
         </div>
@@ -3267,7 +3399,13 @@ function App() {
                   <button disabled={!reviewHighlightMoments.length && !reviewConfirmedHighlightParts.length} onClick={startHighlightReview}><Play size={16} /> Review moments</button>
                 </div>
               </div>
-              <div className="library-controls">
+              {selectedRejectedVideos.length > 0 && (
+ <div className="issue-card compact generation-visible-alert" role="status">
+ <ShieldCheck size={18} />
+ <div><strong>Selected despite the AI red flag</strong><p>{selectedRejectedVideos.length} flagged clip{selectedRejectedVideos.length === 1 ? " is" : "s are"} included because you selected it manually.</p></div>
+ </div>
+ )}
+ <div className="library-controls">
                 <label className="clip-search"><Search size={16} /><input value={clipSearch} onChange={(event) => setClipSearch(event.target.value)} placeholder="Search descriptions or tags..." /></label>
                 <select aria-label="Sort clips" value={clipSort} onChange={(event) => setClipSort(event.target.value as "score" | "duration" | "name")}>
                   <option value="score">Best moments</option>
@@ -3278,6 +3416,7 @@ function App() {
               <div className="library-actions">
                 <div className="view-switcher" aria-label="Library view">
                   <button className={libraryView === "grid" ? "active" : ""} aria-label="Grid view" title="Grid view" onClick={() => setLibraryView("grid")}><Grid2X2 size={16} /></button>
+                  <button className={libraryView === "grid-4" ? "active" : ""} aria-label="Four-column grid view" title="Four-column grid view" onClick={() => setLibraryView("grid-4")}><span className="view-density-icon" aria-hidden="true"><i /><i /><i /><i /></span></button>
                   <button className={libraryView === "list" ? "active" : ""} aria-label="List view" title="List view" onClick={() => setLibraryView("list")}><List size={17} /></button>
                   <button className={libraryView === "detail" ? "active" : ""} aria-label="Detail view" title="Detail view" onClick={() => setLibraryView("detail")}><Layers3 size={17} /></button>
                 </div>
@@ -3320,6 +3459,7 @@ function App() {
                         : rating === "Pending review"
                           ? "Local analysis found a candidate moment; Vision AI has not checked this clip yet"
                         : "Local signal highlight rating; Vision AI has not reviewed this clip yet";
+                  const useCount = Math.max(0, Number(file.metadata?.generationUseCount || 0));
                   return (
                     <article key={file.id} className={`clip-card ${selected ? "selected" : ""} ${generated ? "generated" : ""}`}>
                       {!generated && (
@@ -3346,6 +3486,9 @@ function App() {
                         </span>
                         {!pending && file.metadata?.reviewed === true && (
                           <span className="clip-user-verified" title="You already reviewed this clip. HighlightAI will not ask you to review it again.">user verified</span>
+                        )}
+                        {!pending && (file.metadata?.reviewed === true || useCount > 0) && (
+                          <span className={"clip-use-count " + (file.metadata?.reviewed === true ? "" : "without-verified")} title="Times this source video has been used in a successfully generated export">used {useCount}x</span>
                         )}
                         <small>{file.metadata?.duration ? formatTime(file.metadata.duration) : "Analyzing"}</small>
                       </button>
@@ -3377,7 +3520,7 @@ function App() {
 
             {drafts.length > 0 && drafts[activeDraft] ? (
               <div className="draft-result">
-              <div className="draft-result-head"><span>Draft ready</span><strong>{drafts[activeDraft].title}</strong><small>{formatTime(drafts[activeDraft].duration)} · {drafts[activeDraft].style}</small></div>
+              <div className="draft-result-head"><span>Draft ready</span><strong>{drafts[activeDraft].title}</strong><small>{formatTime(drafts[activeDraft].duration)} - {drafts[activeDraft].style}</small></div>
               <div className="draft-tabs">{drafts.map((draft, index) => <button key={draft.id} className={activeDraft === index ? "active" : ""} onClick={() => setActiveDraft(index)}>Version {index + 1}</button>)}</div>
               {(drafts[activeDraft].exportUrl || project?.files[0]) && <video src={drafts[activeDraft].exportUrl ? localMediaUrl(drafts[activeDraft].exportUrl) : sourceVideoUrl(project!.files[0])} controls preload="metadata" />}
               <div className={`draft-soundtrack ${selectedAudioAsset ? "ready" : "missing"}`}>
@@ -3476,24 +3619,12 @@ function App() {
               </div>
             )}
 
-            {musicCoveragePrompt && (
-              <section className="music-coverage-card" role="alert" aria-label="Add more clips for selected music">
-                <div><Music2 size={17} /><strong>Add more clips for this soundtrack</strong></div>
-                <p>
-                  {musicCoveragePrompt.clipCount} ready clip{musicCoveragePrompt.clipCount === 1 ? "" : "s"} total {formatTime(musicCoveragePrompt.clipDuration)}, but {musicCoveragePrompt.musicName} needs {formatTime(musicCoveragePrompt.musicDuration)}.
-                </p>
-                <div>
-                  <button onClick={() => {
-                    setMusicCoveragePrompt(null);
-                    setNotice("Select more clips from the library, or add more footage before generating.");
-                  }}><Plus size={15} /> Select more clips</button>
-                  <button onClick={() => {
-                    const promptIdea = musicCoveragePrompt.idea;
-                    setMusicCoveragePrompt(null);
-                    void createDraft(promptIdea, { ignoreMusicCoverage: true });
-                  }}>Generate anyway</button>
-                </div>
-              </section>
+
+            {selectedRejectedVideos.length > 0 && (
+              <div className="issue-card compact generation-visible-alert" role="status">
+                <ShieldCheck size={18} />
+                <div><strong>Manual AI-flag override active</strong><p>{selectedRejectedVideos.length} flagged clip{selectedRejectedVideos.length === 1 ? " is" : "s are"} included because you selected it manually.</p></div>
+              </div>
             )}
 
             <section className={`generation-advice-card ${selectedVerifiedMoments < 3 ? "needs-more" : "ready"}`} aria-label="Advice for a better video">
@@ -3569,11 +3700,11 @@ function App() {
                 )}
                 {currentDraft.encoding && (
                   <p className="encoding-summary">
-                    {currentDraft.encoding.width}x{currentDraft.encoding.height} · {currentDraft.encoding.encoder} · {currentDraft.encoding.qualityMode} · {formatBytes(currentDraft.encoding.size)}
+                    {currentDraft.encoding.width}x{currentDraft.encoding.height} - {currentDraft.encoding.encoder} - {currentDraft.encoding.qualityMode} - {formatBytes(currentDraft.encoding.size)}
                   </p>
                 )}
                 {currentDraft.musicPlan && <p className="music-ending-summary">Music ending: {currentDraft.musicPlan.ending}</p>}
-                <p>{formatTime(currentDraft.duration)} · {currentDraft.style}{selectedAudioAsset ? ` · ${selectedAudioAsset.name}` : " · Game audio only"}</p>
+                <p>{formatTime(currentDraft.duration)} - {currentDraft.style}{selectedAudioAsset ? ` - ${selectedAudioAsset.name}` : " - Game audio only"}</p>
                 {currentDraft.exportPath && (
                   <div className="export-location">
                     <span title={currentDraft.exportPath}>{currentDraft.exportPath}</span>
@@ -3665,7 +3796,7 @@ function App() {
                   {addedPathProjects.slice(0, 6).map((item) => (
                     <button key={item.id} onClick={() => void openSavedPath(item)}>
                       <FolderSearch size={16} />
-                      <div><strong>{item.name}</strong><small>{item.sourcePath} · {item.files.length} video{item.files.length === 1 ? "" : "s"}</small></div>
+                      <div><strong>{item.name}</strong><small>{item.sourcePath} - {item.files.length} video{item.files.length === 1 ? "" : "s"}</small></div>
                       <ChevronRight size={16} />
                     </button>
                   ))}
@@ -3690,7 +3821,7 @@ function App() {
                 <span>Continue a local project</span>
                 {recentNonPathProjects.slice(0, 3).map((item) => (
                   <button key={item.id} onClick={() => resumeProject(item)}>
-                    <Video size={15} /><div><strong>{item.name}</strong><small>{item.files.length} recordings · {item.drafts.length} drafts</small></div><ChevronRight size={16} />
+                    <Video size={15} /><div><strong>{item.name}</strong><small>{item.files.length} recordings - {item.drafts.length} drafts</small></div><ChevronRight size={16} />
                   </button>
                 ))}
               </div>
@@ -3779,7 +3910,7 @@ function App() {
               <div className="inline-progress-card">
                 <div>
                   <strong>Folder contents loaded. Analyzing videos in the background.</strong>
-                  <span>{ingestProgress?.processedFiles || 0}/{ingestProgress?.totalFiles || project?.files.length || 0} analyzed · {ingestProgress?.currentFile || "Preparing next file"} · {ingestEta || "Estimating"} remaining</span>
+                  <span>{ingestProgress?.processedFiles || 0}/{ingestProgress?.totalFiles || project?.files.length || 0} analyzed - {ingestProgress?.currentFile || "Preparing next file"} - {ingestEta || "Estimating"} remaining</span>
                 </div>
                 <div className="progress determinate"><span style={{ width: `${Math.max(2, ingestPercent)}%` }} /></div>
               </div>
@@ -3883,6 +4014,12 @@ function App() {
               {selectedVideoIds.length < 1
                 ? <div className="selection-warning"><AlertTriangle size={15} /> Select at least one video before creating a trailer.</div>
                 : <div className="selection-warning ok"><Check size={15} /> Ready: {selectedVideos.length} videos selected for the next draft.</div>}
+              {selectedRejectedVideos.length > 0 && (
+                <div className="issue-card compact generation-visible-alert" role="status">
+                  <ShieldCheck size={18} />
+                  <div><strong>Manual AI-flag override active</strong><p>{selectedRejectedVideos.length} flagged clip{selectedRejectedVideos.length === 1 ? " is" : "s are"} included because you selected it manually.</p></div>
+                </div>
+              )}
               <div className="library-grid">
                 {rankedLibrary.map((file) => {
                   const selected = selectedVideoIds.includes(file.id);
@@ -3893,13 +4030,13 @@ function App() {
                       <div className="library-card-top"><strong>{file.name.replace(/\.[^.]+$/, "")}</strong><span title={`${scoreLabel(file)} highlight score`}>{scoreLabel(file) === "Local signal" ? "Local" : scoreLabel(file) === "Pending review" ? "Pending review" : "AI"} {highlightScore(file)}</span></div>
                       <p>{file.metadata?.indexDescription || (file.metadata?.duration ? `Indexed gameplay clip. Best signal around ${formatTime(file.metadata?.highlightStart || 0)}.` : "Waiting for background analysis.")}</p>
                       <div className="tag-row">{tags.slice(0, 5).map((tag) => <span key={tag}>{tag}</span>)}</div>
-                      <small>{file.metadata?.candidateWindows?.length || 0} candidate windows · {file.metadata?.duration ? formatTime(file.metadata.duration) : "pending analysis"}</small>
+                      <small>{file.metadata?.candidateWindows?.length || 0} candidate windows - {file.metadata?.duration ? formatTime(file.metadata.duration) : "pending analysis"}</small>
                     </button>
                   );
                 })}
               </div>
             </div>
-            <div className="ideas-header"><div><span>Recommended directions</span><h3>What should we make?</h3></div><small>Pick one. I’ll handle the edit.</small></div>
+            <div className="ideas-header"><div><span>Recommended directions</span><h3>What should we make?</h3></div><small>Pick one. I'll handle the edit.</small></div>
             <div className="ideas-grid">
               {analysis.ideas.map((idea, index) => (
                 <button className="idea-card" key={idea.id} onClick={() => createDraft(idea)}>
@@ -3930,7 +4067,7 @@ function App() {
               <div className="draft-list">
                 {drafts.map((draft, index) => (
                   <button key={draft.id} className={activeDraft === index ? "active" : ""} onClick={() => setActiveDraft(index)}>
-                    <span>0{index + 1}</span><div><strong>{draft.title}</strong><small>{formatTime(draft.duration)} · {draft.style}</small></div><ChevronRight size={17} />
+                    <span>0{index + 1}</span><div><strong>{draft.title}</strong><small>{formatTime(draft.duration)} - {draft.style}</small></div><ChevronRight size={17} />
                   </button>
                 ))}
               </div>
@@ -3950,8 +4087,8 @@ function App() {
                     preload="metadata"
                   />
                 )}
-                <div className="preview-top"><span>AI DRAFT · V{drafts[activeDraft].version}</span><span>{drafts[activeDraft].format}</span></div>
-                <div className="preview-title"><small>{drafts[activeDraft].style} highlight</small><strong>{drafts[activeDraft].title}</strong><span>{drafts[activeDraft].moments} best moments · {formatTime(drafts[activeDraft].duration)}</span></div>
+                <div className="preview-top"><span>AI DRAFT - V{drafts[activeDraft].version}</span><span>{drafts[activeDraft].format}</span></div>
+                <div className="preview-title"><small>{drafts[activeDraft].style} highlight</small><strong>{drafts[activeDraft].title}</strong><span>{drafts[activeDraft].moments} best moments - {formatTime(drafts[activeDraft].duration)}</span></div>
                 <div className="preview-progress"><span /></div>
               </div>
               <div className="preview-actions">
@@ -3991,7 +4128,7 @@ function App() {
                 <span className="panel-label">Highlight confirmation</span>
                 <h3>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : "Picked highlight parts"}</h3>
                 <p>{activeHighlightReviewItem && activeHighlightTrim
-                  ? `${highlightReview!.index + 1} of ${highlightReview!.items.length} · ${activeHighlightReviewItem.label} · ${formatTime(activeHighlightTrim.start)}-${formatTime(activeHighlightTrim.end)}`
+                  ? `${highlightReview!.index + 1} of ${highlightReview!.items.length} - ${activeHighlightReviewItem.label} - ${formatTime(activeHighlightTrim.start)}-${formatTime(activeHighlightTrim.end)}`
                   : `${selectedConfirmedHighlightParts.length} confirmed part${selectedConfirmedHighlightParts.length === 1 ? "" : "s"} ready`}</p>
               </div>
               <button aria-label="Close highlight review" onClick={() => setHighlightReview(null)}><X size={20} /></button>
@@ -4076,7 +4213,7 @@ function App() {
                   {selectedConfirmedHighlightParts.length ? selectedConfirmedHighlightParts.map(({ file, moment, id }) => (
                     <article key={id}>
                       <strong>{file.name.replace(/\.[^.]+$/, "")}</strong>
-                      <small>{formatTime(moment.start)}-{formatTime(moment.end)} · {moment.action || moment.source || "highlight"}</small>
+                      <small>{formatTime(moment.start)}-{formatTime(moment.end)} - {moment.action || moment.source || "highlight"}</small>
                       <button onClick={() => reconfirmHighlightPart(file, moment)}><RotateCcw size={14} /> Reconfirm</button>
                     </article>
                   )) : <p>No confirmed highlight parts yet.</p>}
@@ -4111,7 +4248,7 @@ function App() {
             </div>
             <div className="review-generate-actions">
               <button onClick={() => { setReviewGeneratePrompt(false); setReviewGeneratePromptDismissed(true); }}>Keep reviewing</button>
-              <button className="confirm-highlight-button" disabled={generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate now</button>
+              <button className="confirm-highlight-button" disabled={Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate now</button>
             </div>
           </section>
         </div>
@@ -4151,7 +4288,7 @@ function App() {
                   </button>
                   <div>
                     <strong>{draft.title}</strong>
-                    <small>{formatTime(draft.duration)} · {draft.style} · MP4 ready</small>
+                    <small>{formatTime(draft.duration)} - {draft.style} - MP4 ready</small>
                     {draft.exportPath && <span title={draft.exportPath}>{draft.exportPath}</span>}
                   </div>
                   <div className="generated-video-actions">
@@ -4186,7 +4323,7 @@ function App() {
             <div className="public-results">
               {publicAudio.map((audio) => (
                 <article key={audio.id}>
-                  <Music2 size={18} /><div><strong>{audio.title}</strong><span>{audio.creator}</span><small>{audio.licenseUrl ? "License metadata available" : "License unclear — warning required"}</small></div>
+                  <Music2 size={18} /><div><strong>{audio.title}</strong><span>{audio.creator}</span><small>{audio.licenseUrl ? "License metadata available" : "License unclear - warning required"}</small></div>
                   <a href={audio.sourceUrl} target="_blank" rel="noreferrer" aria-label="Open source"><ExternalLink size={15} /></a>
                   <button onClick={() => void addPublicAsset(audio)}><Download size={15} /> Add</button>
                 </article>

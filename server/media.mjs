@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-
-export const MAX_DURATION = 300;
+import { MAX_DURATION } from "./policy.mjs";
+export { loadJson, saveJson } from "./json-store.mjs";
+export { MAX_DURATION } from "./policy.mjs";
 const bundledTools = process.env.HIGHLIGHTAI_FFMPEG_DIR;
 
 export function canStartBackgroundJob(job, runnableStatuses) {
@@ -1318,16 +1319,22 @@ export function recommendTrailerDuration(files, requestedDuration = 0) {
   if (Number(requestedDuration) > 0) return Math.min(MAX_DURATION, Math.max(45, Number(requestedDuration)));
   const sourceFiles = files.filter(isUsableSourceForGeneration);
   const verifiedSeconds = sourceFiles.reduce((sum, file) => {
-    const confirmedSeconds = (file.metadata.confirmedHighlightMoments || []).slice(0, 3)
-      .filter((moment) => !overlapsRejectedHighlight(file.metadata || {}, Number(moment.start) || 0, intervalEnd(moment)))
+    const metadata = file.metadata || {};
+    const confirmedSeconds = (metadata.confirmedHighlightMoments || []).slice(0, 6)
+      .filter((moment) => !overlapsRejectedHighlight(metadata, Number(moment.start) || 0, intervalEnd(moment)))
       .reduce((momentSum, moment) => momentSum + Math.min(18, Math.max(4, Number(moment.duration) || (Number(moment.end) - Number(moment.start)) || 0)), 0);
-    const events = [...(file.metadata.semanticEvents || [])]
-      .filter((event) => !overlapsRejectedHighlight(file.metadata || {}, Number(event.start) || 0, intervalEnd(event)))
+    const events = [...(metadata.semanticEvents || [])]
+      .filter((event) => event.payoffVerified === true)
+      .filter((event) => !overlapsRejectedHighlight(metadata, Number(event.start) || 0, intervalEnd(event)))
       .filter((event) => !["menu", "scoreboard", "map", "loading", "death", "waiting"].includes(event.state))
       .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
-      .slice(0, 2);
-    return sum + confirmedSeconds + events.reduce((eventSum, event) =>
-      eventSum + Math.min(10, Math.max(5, Number(event.end || 0) - Number(event.start || 0) + 2)), 0);
+      .slice(0, 4);
+    const eventSeconds = events.reduce((eventSum, event) =>
+      eventSum + Math.min(18, Math.max(7, Number(event.end || 0) - Number(event.start || 0) + 6)), 0);
+    const verifiedFileBonus = metadata.semanticQuality === "verified" || metadata.aiDecision === "confirmed" || events.length || confirmedSeconds
+      ? Math.min(36, Math.max(0, Number(metadata.duration || 0)))
+      : 0;
+    return sum + Math.max(confirmedSeconds + eventSeconds, verifiedFileBonus);
   }, 0);
   const fallbackSeconds = sourceFiles.reduce((sum, file) =>
     sum + (file.metadata.candidateWindows || []).filter((window) => Number(window.score) >= 85).slice(0, 1)
@@ -1347,7 +1354,7 @@ function isUsableSourceForGeneration(file) {
     !looksLikeGeneratedExport(file.name) &&
     Number(metadata.duration || 0) > 0 &&
     metadata.videoCodec !== "pending" &&
-    metadata.aiDecision !== "rejected";
+    (metadata.aiDecision !== "rejected" || metadata.aiDecisionOverride === "include");
 }
 
 function createSemanticTrailerSegments(files, limit, contentLimit) {
@@ -1491,24 +1498,31 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
   }
   const repeats = Math.max(1, Math.min(2, Math.round(Number(draft.musicRepeats) || 1)));
   const availableMusic = Math.max(1, Math.min(MAX_DURATION, musicDuration * repeats));
-  const { stderr } = await run("ffmpeg", [
-    "-hide_banner", "-i", musicPath,
-    "-af", "asetnsamples=n=22050,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
-    "-f", "null", "-"
-  ]);
-  const frames = [...stderr.matchAll(/pts_time:([\d.]+)[\s\S]*?lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+)/g)]
-    .map((match) => ({ time: Number(match[1]), level: Number(match[2]) }))
-    .filter((frame) => Number.isFinite(frame.level));
-  const firstPassPeaks = frames.filter((frame, index) =>
-    index > 0 && index < frames.length - 1 &&
-    frame.level >= frames[index - 1].level && frame.level >= frames[index + 1].level
-  );
-  const sourcePeaks = firstPassPeaks.filter((peak) => peak.time <= musicDuration);
-  const peaks = [];
-  for (let repeat = 0; repeat < repeats; repeat += 1) {
-    for (const peak of sourcePeaks) {
-      const time = peak.time + repeat * musicDuration;
-      if (time <= availableMusic) peaks.push({ ...peak, time });
+  const needsBeatScan = (draft.segments || []).some((segment) => {
+    const segmentDuration = Number(segment.duration) || 0;
+    const protectedDuration = Math.max(1, Number(segment.minDuration) || 0);
+    return segmentDuration > protectedDuration + 0.25;
+  });
+  let peaks = [];
+  if (needsBeatScan) {
+    const { stderr } = await run("ffmpeg", [
+      "-hide_banner", "-i", musicPath,
+      "-af", "asetnsamples=n=22050,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+      "-f", "null", "-"
+    ]);
+    const frames = [...stderr.matchAll(/pts_time:([\d.]+)[\s\S]*?lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+)/g)]
+      .map((match) => ({ time: Number(match[1]), level: Number(match[2]) }))
+      .filter((frame) => Number.isFinite(frame.level));
+    const firstPassPeaks = frames.filter((frame, index) =>
+      index > 0 && index < frames.length - 1 &&
+      frame.level >= frames[index - 1].level && frame.level >= frames[index + 1].level
+    );
+    const sourcePeaks = firstPassPeaks.filter((peak) => peak.time <= musicDuration);
+    for (let repeat = 0; repeat < repeats; repeat += 1) {
+      for (const peak of sourcePeaks) {
+        const time = peak.time + repeat * musicDuration;
+        if (time <= availableMusic) peaks.push({ ...peak, time });
+      }
     }
   }
   const chooseBeat = (elapsed, naturalEnd, minDuration, maxDuration) => {
@@ -1799,58 +1813,4 @@ function styleFilters(style, format) {
   };
 }
 
-const jsonWriteQueues = new Map();
 
-const transientReplaceErrors = new Set(["EACCES", "EBUSY", "EPERM"]);
-
-async function writeJsonAtomically(filePath, serialized) {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-  try {
-    await writeFile(tempPath, serialized);
-    let lastError;
-    for (let attempt = 0; attempt < 7; attempt += 1) {
-      try {
-        await rename(tempPath, filePath);
-        return;
-      } catch (error) {
-        lastError = error;
-        if (!transientReplaceErrors.has(error?.code) || attempt === 6) break;
-        await new Promise((resolve) => setTimeout(resolve, 20 * (2 ** attempt)));
-      }
-    }
-    if (process.platform !== "win32" || !transientReplaceErrors.has(lastError?.code)) throw lastError;
-    // Windows scanners can briefly lock an existing JSON file. Copying over it
-    // is the last-resort durable replacement after bounded atomic retries.
-    await copyFile(tempPath, filePath);
-  } catch (error) {
-    throw error;
-  } finally {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-  }
-}
-
-export function saveJson(filePath, data) {
-  const serialized = JSON.stringify(data, null, 2);
-  const previous = jsonWriteQueues.get(filePath) || Promise.resolve();
-  const operation = previous.catch(() => undefined).then(() => writeJsonAtomically(filePath, serialized));
-  jsonWriteQueues.set(filePath, operation);
-  operation.finally(() => {
-    if (jsonWriteQueues.get(filePath) === operation) jsonWriteQueues.delete(filePath);
-  }).catch(() => undefined);
-  return operation;
-}
-
-export async function loadJson(filePath) {
-  let lastError;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return JSON.parse(await readFile(filePath, "utf8"));
-    } catch (error) {
-      lastError = error;
-      if (!(error instanceof SyntaxError) || attempt === 2) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
-    }
-  }
-  throw lastError;
-}

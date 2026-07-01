@@ -1,6 +1,5 @@
 import type { Analysis, MediaAsset, VideoIdea } from "../types";
-
-const MAX_DURATION = 300;
+import { MAX_HIGHLIGHT_DURATION } from "../config/policy";
 
 const ideas: VideoIdea[] = [
   {
@@ -68,16 +67,16 @@ export async function analyzeMedia(files: MediaAsset[]): Promise<Analysis> {
     notes: [
       `${estimatedMoments} strong action moments are usable across ${videos.length} recording${videos.length === 1 ? "" : "s"}.`,
       "Audio is clear enough for impact-driven cuts and automatic music ducking.",
-      "The strongest result is a focused highlight under 5 minutes, not a full match recap."
+      "The strongest result is a focused highlight under 3 minutes, not a full match recap."
     ],
-    ideas: ideas.map((idea) => ({ ...idea, duration: Math.min(idea.duration, MAX_DURATION) }))
+    ideas: ideas.map((idea) => ({ ...idea, duration: Math.min(idea.duration, MAX_HIGHLIGHT_DURATION) }))
   };
 }
 
 export const curatedIdeas: VideoIdea[] = ideas;
 
 export function clampDuration(seconds: number) {
-  return Math.min(MAX_DURATION, Math.max(15, seconds));
+  return Math.min(MAX_HIGHLIGHT_DURATION, Math.max(15, seconds));
 }
 
 export function formatBytes(bytes: number) {

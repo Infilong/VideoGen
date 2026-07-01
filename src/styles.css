@@ -331,10 +331,12 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .export-location button { border-color:#c5cec4;background:#f2f5f1;color:#273229; }
 :root[data-theme="light"] .asset-modal header button,
 :root[data-theme="light"] .media-viewer header button,
-:root[data-theme="light"] .generated-video-modal header button { border-color:#c5cec4;background:#eef2ed;color:#263229;box-shadow:none; }
+:root[data-theme="light"] .generated-video-modal header button,
+:root[data-theme="light"] .highlight-review-modal header button { border-color:#c5cec4;background:#eef2ed;color:#263229;box-shadow:none; }
 :root[data-theme="light"] .asset-modal header button:hover,
 :root[data-theme="light"] .media-viewer header button:hover,
-:root[data-theme="light"] .generated-video-modal header button:hover { border-color:#91a18f;background:#e3e9e2;color:#111a13; }
+:root[data-theme="light"] .generated-video-modal header button:hover,
+:root[data-theme="light"] .highlight-review-modal header button:hover { border-color:#91a18f;background:#e3e9e2;color:#111a13; }
 :root[data-theme="light"] .review-generate-summary { background:rgba(98,202,37,.1); border-color:#c5dec0; }
 :root[data-theme="light"] .review-generate-actions button { background:#f5f7f4; color:#172019; border-color:#cfd8cc; }
 :root[data-theme="light"] .selected-count { color:#566159; }

@@ -658,8 +658,22 @@
 .generated-video-actions button,.generated-video-actions a { min-height: 32px; display: flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; background: #11161a; color: #c2cac3; text-decoration: none; font-size: 9px; font-weight: 700; }
 
 @media (max-width: 1100px) {
-  .dashboard { grid-template-columns: 205px minmax(430px,1fr); }
-  .create-panel { position: static; grid-column: 1 / 3; width: 100%; height: auto; border-top: 1px solid var(--line); border-left: 0; overflow: visible; }
+  .dashboard { grid-template-columns: 205px minmax(360px,1fr) 300px; }
+  .clip-workspace { padding: 34px 28px; }
+  .simple-create-panel { padding-inline: 18px; }
+}
+
+@media (max-width: 900px) {
+  .dashboard {
+    grid-template-columns: 205px minmax(0,1fr);
+    grid-template-areas:
+      "footage create"
+      "workspace workspace";
+    overflow: auto;
+  }
+  .footage-sidebar { grid-area: footage; }
+  .clip-workspace { grid-area: workspace; min-height: auto; }
+  .create-panel { grid-area: create; position: static; width: 100%; height: auto; border-top: 0; border-left: 1px solid var(--line); overflow: visible; }
   .create-panel-scroll, .simple-create-panel { overflow: visible; }
 }
 

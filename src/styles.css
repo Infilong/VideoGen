@@ -280,7 +280,8 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .simple-music-picker select { color:#172019; }
 :root[data-theme="light"] .clip-thumbnail { background:radial-gradient(circle at 60% 30%,rgba(112,168,47,.16),transparent 35%),linear-gradient(145deg,#e4eae2,#cfd8ce); }
 :root[data-theme="light"] .generated-folder-card,
-:root[data-theme="light"] .ai-direction { background:linear-gradient(135deg,rgba(134,201,58,.12),#fff); }
+:root[data-theme="light"] .ai-direction,
+:root[data-theme="light"] .highlight-review-empty.review-complete { background:linear-gradient(135deg,rgba(134,201,58,.12),#fff); }
 :root[data-theme="light"] .generated-video-modal,
 :root[data-theme="light"] .generated-video-list article,
 :root[data-theme="light"] .generated-video-actions button,
@@ -302,6 +303,11 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .simple-video-result p { color:#657067; }
 :root[data-theme="light"] .simple-music-picker label { color:#172019; }
 :root[data-theme="light"] .simple-generation-progress { border-color:rgba(57,115,0,.28); background:rgba(57,115,0,.06); }
+:root[data-theme="light"] .generation-advice-card,
+:root[data-theme="light"] .readiness-evidence span,
+:root[data-theme="light"] .review-complete-metrics span { border-color:#d6dfd4;background:#f8faf7;color:#4f5c51; }
+:root[data-theme="light"] .music-coverage-card { border-color:#e3b5a0;background:#fff5ef; }
+:root[data-theme="light"] .music-coverage-card p { color:#725444; }
 :root[data-theme="light"] .auto-ai-banner { border-color:rgba(57,115,0,.26);background:rgba(57,115,0,.055); }
 :root[data-theme="light"] .auto-ai-banner span { color:#536057; }
 :root[data-theme="light"] .auto-ai-banner > button,
@@ -378,8 +384,9 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .picked-highlight-actions button { border-color:#d6dfd4;background:#fff;color:#172019; }
 :root[data-theme="light"] .highlight-review-empty { border-color:#d6dfd4;background:#fff;color:#5d695f; }
 :root[data-theme="light"] .highlight-review-empty strong,
-:root[data-theme="light"] .picked-highlight-panel > div:first-child strong,
+:root[data-theme="light"] .picked-highlight-summary strong,
 :root[data-theme="light"] .picked-highlight-list article strong { color:#172019; }
+:root[data-theme="light"] .picked-highlight-summary small { color:#5d695f; }
 :root[data-theme="light"] .trim-track { background:#dce5d8; }
 :root[data-theme="light"] .picked-highlight-thumbnail { background:#111 !important; }
 :root[data-theme="light"] .picked-highlight-actions .confirm-highlight-button,

@@ -1611,15 +1611,16 @@ function App() {
   async function createDraft(idea: VideoIdea) {
     if (!project) return;
     const generationSourceVideos = selectedVideoIds.length ? selectedVideos : project.files.filter(isSelectableSourceClip);
+    const manualSelectionActive = selectedVideoIds.length > 0;
     const generationVideoIds = generationSourceVideos
-      .filter((file) => semanticState(file) !== "rejected")
+      .filter((file) => manualSelectionActive || semanticState(file) !== "rejected")
       .map((file) => file.id);
     if (!generationVideoIds.length) {
       setNotice("No highlight-ready clips are available yet. Let Vision AI finish or choose stronger clips.");
       return;
     }
     const notReady = generationSourceVideos.filter((file) =>
-      semanticState(file) !== "rejected" &&
+      (manualSelectionActive || semanticState(file) !== "rejected") &&
       (!file.metadata?.duration || file.metadata.videoCodec === "pending")
     );
     if (notReady.length) {
@@ -1683,7 +1684,7 @@ function App() {
       }
       const reviewedGenerationSource = selectedVideoIds.length
         ? workingProject.files.filter((file) => selectedVideoIds.includes(file.id))
-        : workingProject.files.filter(isSelectableSourceClip);
+        : workingProject.files.filter((file) => generationVideoIds.includes(file.id));
       const usableEvents = reviewedGenerationSource.reduce((sum, file) =>
         sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
       const indexedCandidates = reviewedGenerationSource.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
@@ -2859,7 +2860,7 @@ function App() {
     const bestTime = reliableFocusTime(file);
     const moments = potentialMomentSummary(file);
     const state = semanticState(file);
-    if (state === "rejected") return "This clip was flagged by AI; you can still select it if this is a false red flag.";
+    if (state === "rejected") return "AI rejected this clip as low-signal, but that is only a recommendation. Select it to override the flag if this is a false red flag.";
     if (state === "needs_check") return "Needs Vision AI check before it is ranked as verified.";
     if (state === "reviewed") {
       return [
@@ -2925,6 +2926,12 @@ function App() {
   const selectedVerifiedMoments = selectedVideos.reduce((sum, file) =>
     sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
   const selectedConfirmedMoments = selectedVideos.reduce((sum, file) => sum + (file.metadata?.confirmedHighlightMoments || []).length, 0);
+  const selectedConfirmedDuration = selectedVideos.reduce((sum, file) =>
+    sum + (file.metadata?.confirmedHighlightMoments || []).reduce((inner, moment) => {
+      const start = Number(moment.start) || 0;
+      const end = Number(moment.end) || start + Number(moment.duration || 0);
+      return inner + Math.max(0, end - start);
+    }, 0), 0);
   const aiUncertainVideos = rankedLibrary.filter((file) =>
     isVisionReviewableSource(file) &&
     semanticState(file) === "uncertain" &&
@@ -2986,6 +2993,7 @@ function App() {
   }
   const pendingReviewSidebarCount = reviewSidebarParts.filter((part) => part.status === "pending").length;
   const savedReviewSidebarCount = reviewSidebarParts.filter((part) => part.status === "confirmed").length;
+  const reviewQueueDuration = reviewSidebarParts.reduce((sum, part) => sum + Math.max(0, part.end - part.start), 0);
   const selectedWeakOrStale = selectedVideos.filter((file) => ["needs_check", "reviewed", "uncertain"].includes(semanticState(file))).length;
   const selectedIndexedCandidates = selectedVideos.reduce((sum, file) => sum + (file.metadata?.candidateWindows || []).length, 0);
   const selectionReady = selectedVideoIds.length
@@ -2996,6 +3004,25 @@ function App() {
   const selectedDraft = drafts[activeDraft] || drafts[drafts.length - 1] || null;
   const latestExportedDraft = [...drafts].reverse().find((draft) => draft.exportUrl) || null;
   const currentDraft = generating || renderActive ? selectedDraft : selectedDraft?.exportUrl ? selectedDraft : latestExportedDraft || selectedDraft;
+  const pendingReviewDraft = pendingReviewDraftId
+    ? drafts.find((item) => item.id === pendingReviewDraftId) || project?.drafts.find((item) => item.id === pendingReviewDraftId) || null
+    : null;
+  const reviewApprovedSegments = highlightReview
+    ? pendingReviewDraft && project
+      ? approvedSegmentsForReviewDraft(pendingReviewDraft, highlightReview, project.files)
+      : confirmedReviewItemsToSegments(highlightReview)
+    : [];
+  const reviewApprovedDuration = totalSegmentDuration(reviewApprovedSegments);
+  const reviewMusicDuration = effectiveMusicDuration(selectedAudioAsset, musicRepeats);
+  const reviewMusicShortfall = selectedAudioAsset && reviewMusicDuration > 0
+    ? Math.max(0, Math.round((reviewMusicDuration - reviewApprovedDuration) * 10) / 10)
+    : 0;
+  const readinessEvidence = [
+    `${generationSourceVideos.length} clip${generationSourceVideos.length === 1 ? "" : "s"}`,
+    `${selectedVerifiedMoments} verified moment${selectedVerifiedMoments === 1 ? "" : "s"}`,
+    `${formatTime(selectedConfirmedDuration)} saved`,
+    selectedAudioAsset ? `music ${formatTime(reviewMusicDuration)}` : "game audio"
+  ];
   const authoritativeFastIndex = fastIndexJob || project?.fastIndex || null;
   const fastIndexStatus = String(authoritativeFastIndex?.status || "not_started");
   const indexingComplete = ["completed", "completed_with_warnings"].includes(fastIndexStatus);
@@ -3113,11 +3140,10 @@ function App() {
         </p>
         <div>
           <button onClick={() => {
-            setReviewMusicCoveragePrompt(null);
             setReviewGeneratePrompt(false);
             setReviewGeneratePromptDismissed(false);
             navigateToDashboard();
-            setNotice("Select more clips, then click Generate video again. Your reviewed highlights are still saved.");
+            setNotice("Reviewed highlights are saved. Choose more clips, then click Generate video again.");
           }}><Plus size={15} /> Choose more clips</button>
         </div>
       </section>
@@ -3131,10 +3157,10 @@ function App() {
         <header className="review-page-heading">
           <button className="back-button" onClick={navigateToDashboard}><ArrowLeft size={18} /></button>
           <div>
-            <span className="panel-label">{reviewingPlannedDraft ? "Generation review" : "Review page"}</span>
-            <h2>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : reviewingPlannedDraft ? "Review planned video parts" : "Highlight review"}</h2>
+            <span className="panel-label">{reviewingPlannedDraft ? "Review and complete" : "Review page"}</span>
+            <h2>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : reviewingPlannedDraft ? "Review and complete planned parts" : "Highlight review"}</h2>
             <p>{highlightReview
-              ? `${reviewedCount} of ${highlightReview.total} reviewed - ${highlightReview.confirmed} agreed${activeHighlightReviewItem ? ` - Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
+              ? `${reviewedCount} of ${highlightReview.total} reviewed - ${highlightReview.confirmed} agreed - ${formatTime(reviewApprovedDuration)} approved${reviewMusicShortfall > 0 ? ` - ${formatTime(reviewMusicShortfall)} more needed` : ""}${activeHighlightReviewItem ? ` - Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
               : "Choose clips first, then start highlight review."}</p>
           </div>
         </header>
@@ -3205,18 +3231,34 @@ function App() {
                 </footer>
               </>
             ) : (
-              <div className="highlight-review-empty">
+              <div className={`highlight-review-empty ${reviewingPlannedDraft && (highlightReview?.confirmed || savedReviewSidebarCount) ? "review-complete" : ""}`}>
                 <Check size={24} />
-                <strong>{reviewConfirmedHighlightParts.length ? "Review complete" : "No active candidate"}</strong>
-                <span>{reviewConfirmedHighlightParts.length ? "Use the picked parts list, add more candidates, or generate the video." : "Go back to clips and start review again."}</span>
+                <strong>{reviewingPlannedDraft && (highlightReview?.confirmed || savedReviewSidebarCount) ? "All planned parts reviewed" : reviewConfirmedHighlightParts.length ? "Review complete" : "No active candidate"}</strong>
+                <span>{reviewingPlannedDraft && (highlightReview?.confirmed || savedReviewSidebarCount) ? "Your saved highlights are ready for the final music-length check." : reviewConfirmedHighlightParts.length ? "Use the picked parts list, add more candidates, or generate the video." : "Go back to clips and start review again."}</span>
+                {reviewingPlannedDraft && (highlightReview?.confirmed || savedReviewSidebarCount) ? (
+                  <>
+                    <div className="review-complete-metrics">
+                      <span><strong>{formatTime(reviewApprovedDuration)}</strong> approved</span>
+                      <span><strong>{reviewMusicDuration ? formatTime(reviewMusicDuration) : "game audio"}</strong> target</span>
+                      <span><strong>{reviewMusicShortfall > 0 ? formatTime(reviewMusicShortfall) : "ready"}</strong> {reviewMusicShortfall > 0 ? "short" : "status"}</span>
+                    </div>
+                    <button className="confirm-highlight-button" disabled={!reviewGenerationReady || Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate reviewed video</button>
+                  </>
+                ) : null}
               </div>
             )}
           </section>
 
           <aside className="picked-highlight-panel">
-            <div>
-              <span className="panel-label">{reviewingPlannedDraft ? "Planned parts" : "Review queue"}</span>
-              <strong>{pendingReviewSidebarCount} to review - {savedReviewSidebarCount} saved</strong>
+            <div className="picked-highlight-summary">
+              <div>
+                <span className="panel-label">{reviewingPlannedDraft ? "Planned parts" : "Review queue"}</span>
+                <strong>{pendingReviewSidebarCount} to review - {savedReviewSidebarCount} saved</strong>
+              </div>
+              <small>
+                {formatTime(reviewApprovedDuration)} approved
+                {reviewMusicDuration ? ` - ${reviewMusicShortfall > 0 ? `${formatTime(reviewMusicShortfall)} short` : "music covered"}` : ` - ${formatTime(reviewQueueDuration)} queued`}
+              </small>
             </div>
             <div className="picked-highlight-list">
               {reviewSidebarParts.length ? reviewSidebarParts.map((part) => (
@@ -3249,7 +3291,7 @@ function App() {
             <div className="picked-highlight-actions">
               {renderReviewMusicCoveragePrompt()}
               <button onClick={addMoreHighlightCandidates}><Plus size={16} /> Add more</button>
-              <button className="confirm-highlight-button" disabled={!reviewGenerationReady || Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate video</button>
+              <button className="confirm-highlight-button" disabled={!reviewGenerationReady || Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate reviewed video</button>
             </div>
           </aside>
         </div>
@@ -3295,7 +3337,7 @@ function App() {
               ["1", "Add footage"],
               ["2", "Choose clips"],
               ["3", "Set direction"],
-              ["4", "Review video"]
+              ["4", "Review and complete"]
             ].map(([number, label], index) => {
               const step = index + 1;
               return (
@@ -3315,7 +3357,7 @@ function App() {
               <button className="hero-add-button" onClick={() => void chooseLocalFolder()}><FolderSearch size={20} /> Add game folder</button>
               <button className="text-action" onClick={() => recordingInput.current?.click()}>or add individual video files</button>
               <div className="workflow-preview">
-                <span><b>1</b> Add footage</span><ChevronRight size={16} /><span><b>2</b> Review moments</span><ChevronRight size={16} /><span><b>3</b> Generate</span>
+                <span><b>1</b> Add footage</span><ChevronRight size={16} /><span><b>2</b> Review and complete</span><ChevronRight size={16} /><span><b>3</b> Generate</span>
               </div>
               {operationIssue && <div className="issue-card" role="alert"><AlertTriangle size={20} /><div><strong>{operationIssue.title}</strong><p>{operationIssue.message}</p>{operationIssue.action && <small>{operationIssue.action}</small>}</div></div>}
             </div>
@@ -3391,6 +3433,18 @@ function App() {
                     </span>
                     <ChevronRight size={18} />
                   </button>
+                </section>
+              )}
+
+              {reviewMusicCoveragePrompt && pendingReviewDraftId && (
+                <section className="music-coverage-card dashboard-review-recovery" role="status" aria-label="Reviewed parts saved">
+                  <div><Music2 size={17} /><strong>Reviewed parts saved</strong></div>
+                  <p>
+                    {formatTime(reviewMusicCoveragePrompt.clipDuration)} approved, {formatTime(reviewMusicCoveragePrompt.musicDuration)} needed for {reviewMusicCoveragePrompt.musicName}. Choose more clips below, then click Generate video again.
+                  </p>
+                  <div>
+                    <button onClick={navigateToReviewPage}><ArrowRight size={15} /> Return to review</button>
+                  </div>
                 </section>
               )}
 
@@ -3611,7 +3665,7 @@ function App() {
             <header className="simple-create-heading">
               <span className="panel-label">Create video</span>
               <h2>{currentDraft?.exportUrl && !renderActive && !generating ? "Your video is ready" : "Generate your highlight"}</h2>
-              <p>{selectedVideoIds.length ? `${selectedVideoIds.length} clips selected.` : "No manual selection needed."} AI chooses the strongest confirmed moments and final duration.</p>
+              <p>{selectedVideoIds.length ? `${selectedVideoIds.length} clips selected.` : "No manual selection needed."} Next: Generate video creates a plan, then you review planned parts before render.</p>
             </header>
 
             {operationIssue && project && (
@@ -3644,6 +3698,9 @@ function App() {
               ) : (
                 <p>No confirmed highlight-ready clips are available yet. Let Vision AI finish indexing this folder, then generation can build from the strongest moments automatically.</p>
               )}
+              <div className="readiness-evidence" aria-label="Generation readiness evidence">
+                {readinessEvidence.map((item) => <span key={item}>{item}</span>)}
+              </div>
             </section>
 
             <section className="simple-music-picker">
@@ -3724,7 +3781,7 @@ function App() {
             <div className={`selection-status ${generationReady ? "ready" : ""}`}>
               {generationReady ? <Check size={17} /> : <AlertTriangle size={17} />}
               <span>{selectionReady
-                ? `${generationSourceLabel} ready`
+                ? `${generationSourceLabel} ready for review checkpoint`
                 : folderImportActive ? "Footage is still being analyzed" : selectedVideoIds.length ? "Selected clips are still being analyzed" : "No confirmed clips are ready yet"}</span>
             </div>
             <button className="generate-button" disabled={!project || !recommendedIdea || !generationReady || generating || renderActive} onClick={() => recommendedIdea && void createDraft(recommendedIdea)}>

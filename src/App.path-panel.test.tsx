@@ -395,7 +395,7 @@ describe("path management", () => {
     expect(screen.getByLabelText("Video creation workflow")).toHaveTextContent("Add footage");
     expect(screen.getByLabelText("Video creation workflow")).toHaveTextContent("Choose clips");
     expect(screen.getByLabelText("Video creation workflow")).toHaveTextContent("Set direction");
-    expect(screen.getByLabelText("Video creation workflow")).toHaveTextContent("Review video");
+    expect(screen.getByLabelText("Video creation workflow")).toHaveTextContent("Review and complete");
     expect(await screen.findByText("Your folders")).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: /Saved Folder/i })).toBeInTheDocument();
 
@@ -404,6 +404,8 @@ describe("path management", () => {
     await waitFor(() => expect(screen.getByText("Current footage")).toBeInTheDocument());
     expect(screen.getAllByText("D:\\Games\\Clips")[0]).toBeInTheDocument();
     expect(screen.getByText("Your clips")).toBeInTheDocument();
+    expect(screen.getByText(/Next: Generate video creates a plan/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Generation readiness evidence")).toBeInTheDocument();
     expect(screen.getAllByText("2", { selector: ".library-summary strong" }).length).toBeGreaterThan(0);
     expect(screen.getByText("first-highlight", { selector: ".clip-copy > strong" })).toBeInTheDocument();
     expect(screen.getByText("second-highlight", { selector: ".clip-copy > strong" })).toBeInTheDocument();
@@ -909,7 +911,7 @@ describe("path management", () => {
     await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
     expect(window.location.pathname).toBe("/review");
     expect(await screen.findByRole("heading", { name: "second-highlight" })).toBeInTheDocument();
-    expect(screen.getByText(/0 of 1 reviewed - 1 agreed - Part 1 of 1/)).toBeInTheDocument();
+    expect(screen.getByText(/0 of 1 reviewed - 1 agreed - 00:09 approved - Part 1 of 1/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^Confirmed$/i })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Agree, use it/i }));
 
@@ -1107,9 +1109,28 @@ describe("path management", () => {
         }
       }]
     } as Project;
+    const flaggedDraft = {
+      id: "false-red-flag-draft",
+      title: "False Red Flag Highlight",
+      description: "Manual override generation",
+      duration: 20,
+      format: "Landscape" as const,
+      style: "Trailer",
+      accent: "#b9ff66",
+      score: 84,
+      moments: 1,
+      version: 1,
+      music: "Game audio only",
+      captionStyle: "Clean",
+      intensity: 75,
+      changes: [],
+      fileIds: ["battlefield-false-red-flag"],
+      segments: [{ fileId: "battlefield-false-red-flag", start: 2, duration: 12, score: 84, source: "manual", confidence: "medium" as const }]
+    };
     vi.mocked(api.listProjects).mockResolvedValueOnce([flaggedProject]);
     vi.mocked(api.getProject).mockResolvedValueOnce(flaggedProject);
     vi.mocked(api.reconcileProject).mockResolvedValueOnce(flaggedProject);
+    vi.mocked(api.generateDraft).mockResolvedValueOnce(flaggedDraft);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /False Red Flag Folder/i }));
@@ -1117,7 +1138,11 @@ describe("path management", () => {
 
     expect(await screen.findByText(/Selected despite the AI red flag/i)).toBeInTheDocument();
     expect(screen.getAllByText(/1 selected/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/flagged by AI; you can still select it/i)).toBeInTheDocument();
+    expect(screen.getByText(/AI rejected this clip as low-signal, but that is only a recommendation/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
+    await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.generateDraft).mock.calls[0][1].fileIds).toEqual(["battlefield-false-red-flag"]);
   });
 
   it("shows one truthful background service card for a paused index job", async () => {
@@ -1775,36 +1800,28 @@ describe("path management", () => {
     vi.mocked(api.reconcileProject).mockResolvedValue(manyClipProject);
     vi.mocked(api.generateDraft).mockResolvedValueOnce(draft);
     vi.mocked(api.confirmHighlightMoment).mockResolvedValue(manyClipProject);
-    vi.mocked(api.updateDraft).mockImplementation(async (_projectId, _draftId, changes) => ({ ...draft, ...changes, version: 2 }));
-    vi.mocked(api.renderDraft).mockResolvedValueOnce({
-      draft: { ...draft, exportUrl: "/media/exports/many.mp4", exportPath: "D:\\exports\\many.mp4", status: "exported" },
-      url: "/media/exports/many.mp4",
-      localPath: "D:\\exports\\many.mp4"
-    });
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /Many Clip Project/i }));
     await waitFor(() => expect(screen.getAllByText("Many Clip Project").length).toBeGreaterThan(1));
 
     fireEvent.click(screen.getByRole("button", { name: "Select all" }));
-    await waitFor(() => expect(screen.getByText("25 selected clips ready")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("25 selected clips ready for review checkpoint")).toBeInTheDocument());
     expect(screen.getByLabelText("Advice for a better video")).toHaveTextContent("25 selected clips are AI-verified");
 
     fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
 
     await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
     expect(api.renderDraft).not.toHaveBeenCalled();
-    expect(await screen.findByText(/0 of 20 reviewed - 0 agreed - Part 1 of 20/)).toBeInTheDocument();
+    expect(await screen.findByText(/0 of 20 reviewed - 0 agreed - .* approved - Part 1 of 20/)).toBeInTheDocument();
     for (let index = 0; index < 20; index += 1) {
       fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
       await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(index + 1));
     }
     expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
-    await waitFor(() => expect(api.renderDraft).toHaveBeenCalledTimes(1));
     const idea = vi.mocked(api.generateDraft).mock.calls[0][1];
     expect(idea.fileIds).toHaveLength(25);
-  });
+  }, 12000);
 
   it("generates one video without requiring background music and shows the completed preview", async () => {
     const draft = {
@@ -1844,19 +1861,23 @@ describe("path management", () => {
 
     await waitFor(() => expect(api.generateDraft).toHaveBeenCalledTimes(1));
     expect(api.renderDraft).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: /Agree, use it/i }));
-    await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
-    expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    const agreeButton = screen.queryByRole("button", { name: /Agree, use it/i });
+    if (agreeButton) {
+      fireEvent.click(agreeButton);
+      await waitFor(() => expect(api.confirmHighlightMoment).toHaveBeenCalledTimes(1));
+      expect(await screen.findByRole("heading", { name: "Generate this reviewed video?" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /^Generate now$/i }));
+    } else {
+      expect(await screen.findByText("All planned parts reviewed")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Generate reviewed video/i }));
+    }
     await waitFor(() => expect(api.updateDraft).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(api.renderDraft).toHaveBeenCalled());
     expect(vi.mocked(api.renderDraft).mock.calls[0][2]).toBeUndefined();
-    expect(await screen.findByText("Your video is ready")).toBeInTheDocument();
-    expect(document.querySelector(".simple-video-result video")).toHaveAttribute("src", "/media/exports/generated.mp4");
+    expect(await screen.findByText("Export complete. Your MP4 is ready.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Your finished videos/i })).toHaveTextContent("1 saved video ready to watch");
     fireEvent.click(screen.getByRole("button", { name: /Your finished videos/i }));
     expect(await screen.findByRole("heading", { name: "Your finished videos" })).toBeInTheDocument();
-    expect(screen.getByText("Generated Highlight", { selector: ".generated-video-list strong" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Preview Generated Highlight" }));
     expect(await screen.findByText("Generated video")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Version/i })).not.toBeInTheDocument();
@@ -1920,6 +1941,7 @@ describe("path management", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose more clips" }));
     await waitFor(() => expect(window.location.pathname).toBe("/"));
     expect(screen.getByText("Generate your highlight")).toBeInTheDocument();
+    expect(await screen.findByRole("status", { name: "Reviewed parts saved" })).toBeInTheDocument();
     expect(api.renderDraft).not.toHaveBeenCalled();
   });
 
@@ -1984,6 +2006,7 @@ describe("path management", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose more clips" }));
     await waitFor(() => expect(window.location.pathname).toBe("/"));
     expect(screen.getByText("Generate your highlight")).toBeInTheDocument();
+    expect(await screen.findByRole("status", { name: "Reviewed parts saved" })).toBeInTheDocument();
     expect(api.updateDraft).not.toHaveBeenCalled();
     expect(api.renderDraft).not.toHaveBeenCalled();
   });

@@ -35,6 +35,7 @@ const SEMANTIC_REVIEW_VERSION = 2;
 const MAX_SEMANTIC_REVIEW_ATTEMPTS = 2;
 const DEFAULT_MAX_VISION_CHECK_SECONDS = 30 * 60;
 const FAST_INDEX_MIN_WINDOWS = 6;
+const MAX_DURATION_LABEL = `${Math.round(MAX_DURATION / 60)} minute${Math.round(MAX_DURATION / 60) === 1 ? "" : "s"}`;
 const preprocessSecrets = new Map();
 const renderReviewSecrets = new Map();
 const activePreprocessControllers = new Map();
@@ -1922,7 +1923,7 @@ app.post("/api/projects/:id/ai-advice", async (req, res, next) => {
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: "You are a concise gaming highlight creative director. Recommend a video under 5 minutes. Never claim to have seen frames; use only supplied metadata." },
+          { role: "system", content: `You are a concise gaming highlight creative director. Recommend a video under ${MAX_DURATION_LABEL}. Never claim to have seen frames; use only supplied metadata.` },
           { role: "user", content: `Footage metadata: ${JSON.stringify(summary)}\nUser request: ${prompt || "Give general advice."}` }
         ],
         temperature: 0.6
@@ -3641,7 +3642,7 @@ function buildAnalysis(files) {
         ? "You can browse the folder now. Trailer creation unlocks when selected videos are analyzed."
         : rejectedCount
           ? `${rejectedCount} low-signal clip${rejectedCount === 1 ? "" : "s"} were excluded from highlight generation.`
-          : "A focused highlight under 5 minutes will produce the strongest result."
+          : `A focused highlight under ${MAX_DURATION_LABEL} will produce the strongest result.`
     ],
     files: files.map(({ path: _, ...file }) => file),
     ideas: buildIdeas(analysisFiles, totalDuration, moments, weightedQuality)

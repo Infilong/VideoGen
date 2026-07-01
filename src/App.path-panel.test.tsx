@@ -1695,6 +1695,8 @@ describe("path management", () => {
     expect(screen.getByRole("heading", { name: "Generate your highlight" })).toBeInTheDocument();
     expect(screen.getByLabelText("Choose music (optional)")).toHaveValue("");
     expect(screen.getByRole("option", { name: "No background music" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Play music twice, up to 3 minutes" })).toBeInTheDocument();
+    expect(screen.getAllByText("AI chooses the best duration, up to 3 minutes.").length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "Add music file" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Create another version" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Version 1" })).not.toBeInTheDocument();
@@ -1786,7 +1788,7 @@ describe("path management", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Select all" }));
     await waitFor(() => expect(screen.getByText("25 selected clips ready")).toBeInTheDocument());
-    expect(screen.getByLabelText("Advice for a better video")).toHaveTextContent("AI sees 1 verified highlight moment");
+    expect(screen.getByLabelText("Advice for a better video")).toHaveTextContent("25 selected clips are AI-verified");
 
     fireEvent.click(screen.getByRole("button", { name: "Generate video" }));
 

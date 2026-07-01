@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { clampDuration, curatedIdeas, formatBytes, formatTime, toAsset } from "./services/analyzer";
 import { addAssets, cancelRenderJob, checkAiModel, confirmHighlightMoment, deleteProject, estimateFastIndex, estimatePreprocess, findPublicAudio, generateDraft, getDiagnostics, getFastIndexJob, getProject, importPublicAudio, ingestFiles, ingestLocalFolder, issueFromError, listProjects, localMediaUrl, markHighlightReviewed, pauseFastIndexJob, pauseIngestJob, pausePreprocessJob, pauseRenderJob, reconcileProject, rejectHighlightMoment, removeHighlightConfirmation, renderDraft, requestAdvancedAdvice, requestVisionReview, resumeFastIndexJob, resumeIngestJob, resumePreprocessJob, resumeRenderJob, reviewDraft, runFastIndex, runPreprocess, updateDraft } from "./services/api";
+import { MAX_HIGHLIGHT_DURATION_LABEL } from "./config/policy";
 import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestProgress, MediaAsset, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, Segment, Stage, VideoIdea } from "./types";
 
 const suggestions = [
@@ -2920,6 +2921,7 @@ function App() {
     ? `${selectedVideoIds.length} selected clip${selectedVideoIds.length === 1 ? "" : "s"}`
     : `${generationSourceVideos.length} confirmed clip${generationSourceVideos.length === 1 ? "" : "s"}`;
   const readySelectedVideos = selectedVideos.filter((file) => file.metadata?.duration && file.metadata.videoCodec !== "pending");
+  const selectedVerifiedClips = selectedVideos.filter((file) => semanticState(file) === "verified" || hasAutoUsableHighlightCandidate(file)).length;
   const selectedVerifiedMoments = selectedVideos.reduce((sum, file) =>
     sum + (file.metadata?.semanticEvents || []).filter((event) => event.payoffVerified === true).length, 0);
   const selectedConfirmedMoments = selectedVideos.reduce((sum, file) => sum + (file.metadata?.confirmedHighlightMoments || []).length, 0);
@@ -3600,7 +3602,7 @@ function App() {
                 </button>
               </>
             )}
-            <small className="duration-note"><Clock3 size={14} /> AI chooses the best duration, up to 5 minutes.</small>
+            <small className="duration-note"><Clock3 size={14} /> AI chooses the best duration, up to {MAX_HIGHLIGHT_DURATION_LABEL}.</small>
           </div>
         </aside>
 
@@ -3634,8 +3636,10 @@ function App() {
                   {generationAdvice || (!selectedVideoIds.length
                     ? `The editor will use ${generationSourceVideos.length} confirmed clip${generationSourceVideos.length === 1 ? "" : "s"}, reject low-signal footage, balance repeated actions, and build a paced arc automatically.`
                     : selectedVerifiedMoments < 3
-                    ? `AI sees ${selectedVerifiedMoments} verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"} and ${selectedWeakOrStale} selected clip${selectedWeakOrStale === 1 ? " has" : "s have"} lower confidence. Generate will still auto-rank the strongest uncertain and indexed moments.`
-                    : `This selection has ${selectedVerifiedMoments} AI-verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"}, ${selectedConfirmedMoments} saved period${selectedConfirmedMoments === 1 ? "" : "s"}, and ${selectedIndexedCandidates} indexed candidate moment${selectedIndexedCandidates === 1 ? "" : "s"}. Confirmed periods are used first.`)}
+                    ? selectedVerifiedClips
+                      ? `${selectedVerifiedClips} selected clip${selectedVerifiedClips === 1 ? " is" : "s are"} AI-verified. Generate will auto-rank ${selectedIndexedCandidates} indexed candidate moment${selectedIndexedCandidates === 1 ? "" : "s"} and any uncertain moments instead of blocking.`
+                      : `AI sees ${selectedVerifiedMoments} verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"} and ${selectedWeakOrStale} selected clip${selectedWeakOrStale === 1 ? " has" : "s have"} lower confidence. Generate will still auto-rank the strongest uncertain and indexed moments.`
+                    : `This selection has ${selectedVerifiedMoments} AI-verified highlight moment${selectedVerifiedMoments === 1 ? "" : "s"}, ${selectedVerifiedClips} verified clip${selectedVerifiedClips === 1 ? "" : "s"}, ${selectedConfirmedMoments} saved period${selectedConfirmedMoments === 1 ? "" : "s"}, and ${selectedIndexedCandidates} indexed candidate moment${selectedIndexedCandidates === 1 ? "" : "s"}. Confirmed periods are used first.`)}
                 </p>
               ) : (
                 <p>No confirmed highlight-ready clips are available yet. Let Vision AI finish indexing this folder, then generation can build from the strongest moments automatically.</p>
@@ -3652,7 +3656,7 @@ function App() {
               <label htmlFor="music-repeat-select">Video length</label>
               <select id="music-repeat-select" value={musicRepeats} onChange={(event) => setMusicRepeats(Number(event.target.value) === 2 ? 2 : 1)}>
                 <option value={1}>Use music once</option>
-                <option value={2}>Play music twice, up to 5 min</option>
+                <option value={2}>Play music twice, up to {MAX_HIGHLIGHT_DURATION_LABEL}</option>
               </select>
               <small>Music already added to this project appears in the list.</small>
             </section>
@@ -3728,7 +3732,7 @@ function App() {
                 ? <><LoaderCircle size={19} /> Generating...</>
                 : <><Sparkles size={19} /> Generate video</>}
             </button>
-            <small className="duration-note"><Clock3 size={14} /> AI chooses the best duration, up to 5 minutes.</small>
+            <small className="duration-note"><Clock3 size={14} /> AI chooses the best duration, up to {MAX_HIGHLIGHT_DURATION_LABEL}.</small>
           </div>
         </aside>
       </main>
